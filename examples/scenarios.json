@@ -1,0 +1,23 @@
+{
+  "fidelity": "sandbox",
+  "rules": [
+    {
+      "description": "Every subscription renewal fails, so dunning runs to cancellation",
+      "match": { "operation": "subscription.renew" },
+      "outcome": "fail:insufficient_funds",
+      "uses": "unlimited"
+    },
+    {
+      "description": "Payouts with a reference starting 'slow_' take an extra hour",
+      "match": { "operation": "payout.create", "reference_prefix": "slow_" },
+      "outcome": { "kind": "delay", "settle_after": "1h" },
+      "uses": "unlimited"
+    },
+    {
+      "description": "The next crypto checkout is underpaid",
+      "match": { "operation": "checkout.pay", "currency": "USD" },
+      "outcome": "partial:10.00:USD",
+      "uses": 1
+    }
+  ]
+}

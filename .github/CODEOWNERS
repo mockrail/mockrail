@@ -1,0 +1,8 @@
+# Core and shared infrastructure
+/packages/core/      @mockrail/core-maintainers
+/packages/server/    @mockrail/core-maintainers
+/packages/cli/       @mockrail/core-maintainers
+/packages/testing/   @mockrail/core-maintainers
+
+# Each adapter has its own maintainers
+/packages/adapter-bachs/  @mockrail/adapter-bachs

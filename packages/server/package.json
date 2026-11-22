@@ -1,0 +1,29 @@
+{
+  "name": "@mockrail/server",
+  "version": "0.1.0",
+  "description": "mockrail HTTP gateway, webhook dispatcher and control plane. Loads provider adapters from config.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@mockrail/core": "workspace:*",
+    "@mockrail/adapter-bachs": "workspace:*"
+  }
+}

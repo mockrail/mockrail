@@ -1,0 +1,29 @@
+{
+  "name": "@mockrail/testing",
+  "version": "0.1.0",
+  "description": "Test helpers for mockrail: start a sandbox, advance the clock, await a webhook.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@mockrail/core": "workspace:*",
+    "@mockrail/server": "workspace:*"
+  }
+}
