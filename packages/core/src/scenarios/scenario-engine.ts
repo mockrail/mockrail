@@ -2,6 +2,7 @@ import { isCurrencyCode } from '../money/currency.js';
 import { SandboxError } from '../shared/errors.js';
 import type { IdGenerator } from '../shared/ids.js';
 import type { Store } from '../store/store.js';
+import { localOf } from '../shared/owners.js';
 import {
   FAILURE_REASONS,
   OPERATIONS,
@@ -101,7 +102,7 @@ export class ScenarioEngine {
 
 function matches(matcher: OperationMatcher, context: ScenarioContext): boolean {
   if (matcher.operation !== '*' && matcher.operation !== context.operation) return false;
-  if (matcher.ownerId && matcher.ownerId !== context.ownerId) return false;
+  if (matcher.ownerId && matcher.ownerId !== context.ownerId && matcher.ownerId !== localOf(context.ownerId ?? '')) return false;
   if (matcher.currency && matcher.currency !== context.currency) return false;
   if (matcher.referencePrefix) {
     const prefix = matcher.referencePrefix;

@@ -4,16 +4,20 @@ import { byNewest, C } from '../shared/collections.js';
 import type { CoreContext } from '../shared/context.js';
 import { notFound, SandboxError, validationFailed } from '../shared/errors.js';
 import type { Metadata } from '../shared/json.js';
-import { PLATFORM_OWNER } from '../shared/owners.js';
-import type { AccountsService } from './accounts.js';
+import { isPlatformOwner, platformOf } from '../shared/owners.js';
+
+export type TransferKind = 'payout' | 'manual';
 
 export interface Transfer {
   readonly id: string;
-  /** Who the money left (the platform). */
-  readonly ownerId: string;
-  readonly destination: string;
+  /** Owner debited. */
+  readonly sourceOwner: string;
+  /** Owner credited. */
+  readonly destinationOwner: string;
   readonly amount: Money;
+  readonly kind: TransferKind;
   readonly sourceChargeId: string | null;
+  readonly transferGroup: string | null;
   readonly description: string | null;
   readonly metadata: Metadata;
   readonly createdAt: string;
@@ -21,40 +25,50 @@ export interface Transfer {
 
 export interface PlatformFee {
   readonly id: string;
-  /** Connected account the fee was collected from. */
-  readonly accountId: string;
+  readonly platformOwner: string;
+  /** Owner the fee was collected from. */
+  readonly collectedFrom: string;
   readonly chargeId: string;
   readonly amount: Money;
   readonly createdAt: string;
 }
 
 export interface CreateTransferInput {
-  readonly destination: string;
+  readonly sourceOwner: string;
+  readonly destinationOwner: string;
   readonly amount: Money;
+  readonly transferGroup?: string | null;
   readonly description?: string | null;
   readonly metadata?: Metadata;
 }
 
 export class TransfersService {
-  constructor(
-    private readonly ctx: CoreContext,
-    private readonly accounts: AccountsService,
-  ) {}
+  constructor(private readonly ctx: CoreContext) {}
 
-  /** A separate transfer from the platform's available balance to a connected account. */
+  /** A separate transfer from one owner's available balance to another in the same platform. */
   create(input: CreateTransferInput): Transfer {
     if (input.amount.amountMinor <= 0n) throw validationFailed([{ field: 'amount', message: 'Amount must be greater than zero.' }]);
-    this.accounts.get(input.destination);
-    const available = this.ctx.ledger.bucketBalance(PLATFORM_OWNER, 'available', input.amount.currency);
+    if (platformOf(input.sourceOwner) !== platformOf(input.destinationOwner)) throw notFound('account', input.destinationOwner);
+    if (input.sourceOwner === input.destinationOwner) throw validationFailed([{ field: 'destination', message: 'Source and destination are the same.' }]);
+    const available = this.ctx.ledger.bucketBalance(input.sourceOwner, 'available', input.amount.currency);
     if (available < input.amount.amountMinor) {
-      throw new SandboxError('insufficient_balance', 'The platform balance is too low for this transfer.', {
+      throw new SandboxError('insufficient_balance', 'The available balance is too low for this transfer.', {
         details: { available: available.toString(), requested: input.amount.amountMinor.toString(), currency: input.amount.currency },
       });
     }
-    const transfer = this.record({ destination: input.destination, amount: input.amount, sourceChargeId: null, description: input.description ?? null, metadata: input.metadata ?? {} });
+    const transfer = this.record({
+      sourceOwner: input.sourceOwner,
+      destinationOwner: input.destinationOwner,
+      amount: input.amount,
+      kind: 'manual',
+      sourceChargeId: null,
+      transferGroup: input.transferGroup ?? null,
+      description: input.description ?? null,
+      metadata: input.metadata ?? {},
+    });
     this.ctx.ledger.move(
-      ledgerAccounts.balance(PLATFORM_OWNER, 'available'),
-      ledgerAccounts.balance(input.destination, 'available'),
+      ledgerAccounts.balance(input.sourceOwner, 'available'),
+      ledgerAccounts.balance(input.destinationOwner, 'available'),
       input.amount,
       'transfer',
       transfer.id,
@@ -63,41 +77,61 @@ export class TransfersService {
   }
 
   /** Records a transfer whose ledger movement was already posted as part of a charge. */
-  recordFromCharge(input: { readonly destination: string; readonly amount: Money; readonly chargeId: string }): Transfer {
-    return this.record({ destination: input.destination, amount: input.amount, sourceChargeId: input.chargeId, description: null, metadata: {} });
+  recordFromCharge(input: { readonly fromOwner: string; readonly toOwner: string; readonly amount: Money; readonly chargeId: string }): Transfer {
+    return this.record({
+      sourceOwner: input.fromOwner,
+      destinationOwner: input.toOwner,
+      amount: input.amount,
+      kind: 'payout',
+      sourceChargeId: input.chargeId,
+      transferGroup: null,
+      description: null,
+      metadata: {},
+    });
   }
 
-  recordPlatformFee(input: { readonly accountId: string; readonly chargeId: string; readonly amount: Money }): PlatformFee {
-    const fee: PlatformFee = { id: this.ctx.ids.next('fee'), ...input, createdAt: this.ctx.nowIso() };
+  recordPlatformFee(input: { readonly platformOwner: string; readonly collectedFrom: string; readonly chargeId: string; readonly amount: Money }): PlatformFee {
+    const fee: PlatformFee = { id: this.ctx.ids.entity('platform_fee', input.platformOwner), ...input, createdAt: this.ctx.nowIso() };
     this.ctx.store.put(C.platformFees, fee);
-    this.ctx.events.publish('platform_fee.created', PLATFORM_OWNER, { platformFee: fee });
+    this.ctx.events.publish('platform_fee.created', input.platformOwner, { platformFee: fee });
     return fee;
   }
 
-  get(id: string): Transfer {
+  get(platformOwner: string, id: string): Transfer {
     const transfer = this.ctx.store.get<Transfer>(C.transfers, id);
-    if (!transfer) throw notFound('transfer', id);
+    if (!transfer || platformOf(transfer.sourceOwner) !== platformOwner) throw notFound('transfer', id);
     return transfer;
   }
 
-  list(filter: { readonly destination?: string } = {}): Transfer[] {
-    return this.ctx.store.list<Transfer>(C.transfers, (t) => !filter.destination || t.destination === filter.destination).sort(byNewest);
+  list(platformOwner: string, filter: { readonly owner?: string; readonly kind?: TransferKind } = {}): Transfer[] {
+    return this.ctx.store
+      .list<Transfer>(C.transfers, (t) => {
+        if (platformOf(t.sourceOwner) !== platformOwner) return false;
+        if (filter.owner && t.sourceOwner !== filter.owner && t.destinationOwner !== filter.owner) return false;
+        if (filter.kind && t.kind !== filter.kind) return false;
+        return true;
+      })
+      .sort(byNewest);
   }
 
-  getPlatformFee(id: string): PlatformFee {
+  getPlatformFee(platformOwner: string, id: string): PlatformFee {
     const fee = this.ctx.store.get<PlatformFee>(C.platformFees, id);
-    if (!fee) throw notFound('platform fee', id);
+    if (!fee || fee.platformOwner !== platformOwner) throw notFound('platform fee', id);
     return fee;
   }
 
-  listPlatformFees(filter: { readonly accountId?: string } = {}): PlatformFee[] {
-    return this.ctx.store.list<PlatformFee>(C.platformFees, (f) => !filter.accountId || f.accountId === filter.accountId).sort(byNewest);
+  listPlatformFees(platformOwner: string, filter: { readonly chargeId?: string } = {}): PlatformFee[] {
+    return this.ctx.store
+      .list<PlatformFee>(C.platformFees, (f) => f.platformOwner === platformOwner && (!filter.chargeId || f.chargeId === filter.chargeId))
+      .sort(byNewest);
   }
 
-  private record(fields: Omit<Transfer, 'id' | 'ownerId' | 'createdAt'>): Transfer {
-    const transfer: Transfer = { id: this.ctx.ids.next('tr'), ownerId: PLATFORM_OWNER, ...fields, createdAt: this.ctx.nowIso() };
+  private record(fields: Omit<Transfer, 'id' | 'createdAt'>): Transfer {
+    const transfer: Transfer = { id: this.ctx.ids.entity('transfer', platformOf(fields.sourceOwner)), ...fields, createdAt: this.ctx.nowIso() };
     this.ctx.store.put(C.transfers, transfer);
-    this.ctx.events.publish('transfer.created', transfer.destination, { transfer });
+    // The connected account is the origin in both directions.
+    const origin = isPlatformOwner(fields.destinationOwner) ? fields.sourceOwner : fields.destinationOwner;
+    this.ctx.events.publish('transfer.created', origin, { transfer });
     return transfer;
   }
 }

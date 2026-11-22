@@ -4,7 +4,7 @@ import type { CoreContext } from '../shared/context.js';
 import { notFound } from '../shared/errors.js';
 
 export type InvoiceStatus = 'open' | 'paid' | 'uncollectible' | 'void';
-export type BillingReason = 'subscription_create' | 'subscription_cycle' | 'trial_end';
+export type BillingReason = 'subscription_create' | 'subscription_cycle' | 'subscription_update' | 'trial_end';
 
 export interface Invoice {
   readonly id: string;
@@ -14,6 +14,7 @@ export interface Invoice {
   readonly amount: Money;
   readonly status: InvoiceStatus;
   readonly billingReason: BillingReason;
+  readonly kind: 'cycle' | 'proration';
   readonly periodStart: string;
   readonly periodEnd: string;
   readonly attemptCount: number;
@@ -24,14 +25,19 @@ export interface Invoice {
   readonly updatedAt: string;
 }
 
+export type CreateInvoiceInput = Pick<Invoice, 'ownerId' | 'subscriptionId' | 'customerId' | 'amount' | 'billingReason' | 'periodStart' | 'periodEnd'> & {
+  readonly kind?: Invoice['kind'];
+};
+
 export class InvoicesService {
   constructor(private readonly ctx: CoreContext) {}
 
-  create(fields: Pick<Invoice, 'ownerId' | 'subscriptionId' | 'customerId' | 'amount' | 'billingReason' | 'periodStart' | 'periodEnd'>): Invoice {
+  create(fields: CreateInvoiceInput): Invoice {
     const now = this.ctx.nowIso();
     const invoice: Invoice = {
-      id: this.ctx.ids.next('in'),
+      id: this.ctx.ids.entity('invoice', fields.ownerId),
       ...fields,
+      kind: fields.kind ?? 'cycle',
       status: 'open',
       attemptCount: 0,
       nextPaymentAttempt: null,

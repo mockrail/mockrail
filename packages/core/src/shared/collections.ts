@@ -1,6 +1,7 @@
 /** Store collection names used by the domain modules. */
 export const C = {
   customers: 'customers',
+  paymentMethods: 'payment_methods',
   products: 'products',
   checkouts: 'checkout_sessions',
   charges: 'charges',
@@ -14,6 +15,7 @@ export const C = {
   accounts: 'accounts',
   persons: 'persons',
   accountDocuments: 'account_documents',
+  accountLinks: 'account_links',
   transfers: 'transfers',
   platformFees: 'platform_fees',
   webhookEndpoints: 'webhook_endpoints',

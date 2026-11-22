@@ -1,6 +1,7 @@
 export type DomainEventType =
   | 'customer.created'
   | 'customer.updated'
+  | 'payment_method.saved'
   | 'product.created'
   | 'product.updated'
   | 'checkout.created'
@@ -28,6 +29,8 @@ export type DomainEventType =
   | 'payout.processing'
   | 'payout.completed'
   | 'payout.failed'
+  | 'payout_destination.approved'
+  | 'payout_destination.rejected'
   | 'account.created'
   | 'account.updated'
   | 'account.tasks_requested'

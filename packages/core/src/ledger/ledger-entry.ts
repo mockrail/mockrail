@@ -1,7 +1,7 @@
 import type { CurrencyCode } from '../money/currency.js';
 import type { Money } from '../money/money.js';
 
-export type BalanceBucket = 'available' | 'pending' | 'reserved';
+export type BalanceBucket = 'available' | 'pending' | 'reserved' | 'held';
 
 export type LedgerDirection = 'debit' | 'credit';
 
@@ -34,6 +34,6 @@ export interface LedgerTransaction {
 /** Ledger account names. Owner balance accounts are liabilities: credits increase them. */
 export const ledgerAccounts = {
   balance: (ownerId: string, bucket: BalanceBucket): string => `owner:${ownerId}:${bucket}`,
-  external: (rail: 'card_network' | 'bank_transfer' | 'crypto' | 'mobile_money' | 'payout_rail' | 'refunds'): string =>
+  external: (rail: 'card_network' | 'bank_transfer' | 'crypto' | 'mobile_money' | 'payout_rail' | 'refunds' | 'provider_fees'): string =>
     `external:${rail}`,
 } as const;

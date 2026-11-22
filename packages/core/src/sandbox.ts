@@ -93,12 +93,12 @@ export class Sandbox {
     this.customers = new CustomersService(ctx);
     this.products = new ProductsService(ctx);
     this.accounts = new AccountsService(ctx);
-    this.transfers = new TransfersService(ctx, this.accounts);
+    this.transfers = new TransfersService(ctx);
     this.charges = new ChargesService(ctx, this.accounts, this.transfers);
     this.invoices = new InvoicesService(ctx);
-    this.subscriptions = new SubscriptionsService(ctx, this.charges, this.invoices);
+    this.subscriptions = new SubscriptionsService(ctx, this.charges, this.invoices, this.customers);
     this.checkout = new CheckoutService(ctx, this.products, this.customers, this.charges, this.subscriptions);
-    this.virtualAccounts = new VirtualAccountsService(ctx, this.customers, this.charges);
+    this.virtualAccounts = new VirtualAccountsService(ctx, this.charges);
     this.refunds = new RefundsService(ctx, this.charges);
     this.payouts = new PayoutsService(ctx);
     this.webhooks = new WebhooksService(ctx);

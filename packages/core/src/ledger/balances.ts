@@ -10,6 +10,8 @@ export interface OwnerBalance {
   readonly available: bigint;
   readonly pending: bigint;
   readonly reserved: bigint;
+  /** Funds held for review (e.g. over-limit deposits): neither available nor pending. */
+  readonly held: bigint;
 }
 
 /** Balances are always derived from entries, never stored as a mutable number. */
@@ -60,10 +62,10 @@ export class Ledger {
 
   balancesFor(ownerId: string): OwnerBalance[] {
     const prefix = `owner:${ownerId}:`;
-    const byCurrency = new Map<CurrencyCode, { available: bigint; pending: bigint; reserved: bigint }>();
+    const byCurrency = new Map<CurrencyCode, { available: bigint; pending: bigint; reserved: bigint; held: bigint }>();
     for (const entry of this.store.list<LedgerEntry>(LEDGER_ENTRIES, (e) => e.account.startsWith(prefix))) {
       const bucket = entry.account.slice(prefix.length) as BalanceBucket;
-      const row = byCurrency.get(entry.currency) ?? { available: 0n, pending: 0n, reserved: 0n };
+      const row = byCurrency.get(entry.currency) ?? { available: 0n, pending: 0n, reserved: 0n, held: 0n };
       row[bucket] += entry.direction === 'credit' ? entry.amountMinor : -entry.amountMinor;
       byCurrency.set(entry.currency, row);
     }

@@ -1,5 +1,4 @@
-import type { Charge, ChargesService } from '../charges/charges.js';
-import type { CustomersService } from '../customers/customers.js';
+import type { Charge, ChargesService, FeeRule } from '../charges/charges.js';
 import type { CurrencyCode } from '../money/currency.js';
 import type { Money } from '../money/money.js';
 import { byNewest, C } from '../shared/collections.js';
@@ -9,29 +8,32 @@ import { notFound, SandboxError, validationFailed } from '../shared/errors.js';
 export interface VirtualAccount {
   readonly id: string;
   readonly ownerId: string;
-  readonly customerId: string | null;
   readonly currency: CurrencyCode;
   readonly accountNumber: string;
-  readonly accountName: string;
+  readonly accountName: string | null;
   readonly bankName: string;
+  readonly bankCode: string | null;
+  readonly status: 'active' | 'inactive';
   /** Deposits above this many minor units are held. Null = no limit. */
   readonly perDepositLimitMinor: bigint | null;
   /** Deposits that push the UTC-day total above this are held. Null = no limit. */
   readonly dailyLimitMinor: bigint | null;
+  readonly depositFeeRule: FeeRule | null;
   readonly createdAt: string;
 }
 
 export interface CreateVirtualAccountInput {
   readonly ownerId: string;
   readonly currency: CurrencyCode;
-  readonly customerId?: string | null;
   readonly accountName?: string | null;
   /** Provider-specific presentation, supplied by the adapter. */
   readonly bankName: string;
+  readonly bankCode?: string | null;
   readonly numberPrefix: string;
   readonly numberLength: number;
   readonly perDepositLimitMinor?: bigint | null;
   readonly dailyLimitMinor?: bigint | null;
+  readonly depositFeeRule?: FeeRule | null;
 }
 
 export interface SimulateDepositInput {
@@ -40,6 +42,8 @@ export interface SimulateDepositInput {
   readonly senderName?: string | null;
   readonly senderAccountNumber?: string | null;
   readonly senderBankName?: string | null;
+  readonly senderBankCode?: string | null;
+  readonly narration?: string | null;
   readonly reference?: string | null;
 }
 
@@ -48,7 +52,6 @@ const RELEASE_JOB = 'deposit.release';
 export class VirtualAccountsService {
   constructor(
     private readonly ctx: CoreContext,
-    private readonly customers: CustomersService,
     private readonly charges: ChargesService,
   ) {
     ctx.scheduler.register<{ chargeId: string }>(RELEASE_JOB, ({ chargeId }) => {
@@ -57,46 +60,44 @@ export class VirtualAccountsService {
     });
   }
 
-  /** Returns the existing account for the same owner, currency and customer, so repeat calls give the same number. */
-  create(input: CreateVirtualAccountInput): VirtualAccount {
-    const customerId = input.customerId ?? null;
-    if (customerId) this.customers.get(input.ownerId, customerId);
-    const existing = this.ctx.store.list<VirtualAccount>(
-      C.virtualAccounts,
-      (va) => va.ownerId === input.ownerId && va.currency === input.currency && va.customerId === customerId,
-    )[0];
-    if (existing) return existing;
-
-    const customer = this.customers.find(customerId);
+  /** One account per owner and currency: repeat calls return the same number. */
+  create(input: CreateVirtualAccountInput): { account: VirtualAccount; created: boolean } {
+    const existing = this.find(input.ownerId, input.currency);
+    if (existing) return { account: existing, created: false };
     const account: VirtualAccount = {
-      id: this.ctx.ids.next('va'),
+      id: this.ctx.ids.entity('virtual_account', input.ownerId),
       ownerId: input.ownerId,
-      customerId,
       currency: input.currency,
       accountNumber: this.uniqueNumber(input.numberPrefix, input.numberLength),
-      accountName: input.accountName ?? customer?.name ?? 'Sandbox Merchant',
+      accountName: input.accountName ?? null,
       bankName: input.bankName,
+      bankCode: input.bankCode ?? null,
+      status: 'active',
       perDepositLimitMinor: input.perDepositLimitMinor ?? null,
       dailyLimitMinor: input.dailyLimitMinor ?? null,
+      depositFeeRule: input.depositFeeRule ?? null,
       createdAt: this.ctx.nowIso(),
     };
     this.ctx.store.put(C.virtualAccounts, account);
     this.ctx.events.publish('virtual_account.created', account.ownerId, { virtualAccount: account });
+    return { account, created: true };
+  }
+
+  find(ownerId: string, currency: CurrencyCode): VirtualAccount | null {
+    return this.ctx.store.list<VirtualAccount>(C.virtualAccounts, (va) => va.ownerId === ownerId && va.currency === currency)[0] ?? null;
+  }
+
+  get(ownerId: string, currency: CurrencyCode): VirtualAccount {
+    const account = this.find(ownerId, currency);
+    if (!account) throw notFound('virtual account', currency);
     return account;
   }
 
-  list(ownerId: string, filter: { readonly currency?: CurrencyCode; readonly customerId?: string } = {}): VirtualAccount[] {
-    return this.ctx.store
-      .list<VirtualAccount>(C.virtualAccounts, (va) => {
-        if (va.ownerId !== ownerId) return false;
-        if (filter.currency && va.currency !== filter.currency) return false;
-        if (filter.customerId && va.customerId !== filter.customerId) return false;
-        return true;
-      })
-      .sort(byNewest);
+  list(ownerId: string): VirtualAccount[] {
+    return this.ctx.store.list<VirtualAccount>(C.virtualAccounts, (va) => va.ownerId === ownerId).sort(byNewest);
   }
 
-  find(id: string | null | undefined): VirtualAccount | null {
+  findById(id: string | null | undefined): VirtualAccount | null {
     return id ? this.ctx.store.get<VirtualAccount>(C.virtualAccounts, id) ?? null : null;
   }
 
@@ -127,14 +128,18 @@ export class VirtualAccountsService {
       ownerId: account.ownerId,
       amount: outcome.kind === 'partial' ? outcome.receivedAmount : input.amount,
       virtualAccountId: account.id,
-      customerId: account.customerId,
+      customerId: null,
       reference: input.reference ?? null,
+      feeRule: account.depositFeeRule,
       held,
       paymentMethod: {
         type: 'bank_transfer',
-        senderName: input.senderName ?? 'Sandbox Sender',
+        senderName: input.senderName ?? 'SANDBOX SENDER',
         senderAccountNumber: input.senderAccountNumber ?? '0123456789',
         senderBankName: input.senderBankName ?? 'Sandbox Sender Bank',
+        senderBankCode: input.senderBankCode ?? '000',
+        sessionId: `0000${this.ctx.ids.digits(26)}`,
+        narration: input.narration ?? null,
       },
     });
     if (outcome.kind === 'delay' && !overLimit) {

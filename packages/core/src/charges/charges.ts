@@ -5,7 +5,7 @@ import { byNewest, C } from '../shared/collections.js';
 import type { CoreContext } from '../shared/context.js';
 import { notFound, SandboxError, validationFailed, type FieldError } from '../shared/errors.js';
 import type { Metadata } from '../shared/json.js';
-import { PLATFORM_OWNER } from '../shared/owners.js';
+import { isPlatformOwner, ownerId as makeOwner, platformOf, providerOf } from '../shared/owners.js';
 import type { AccountsService } from '../connect/accounts.js';
 import type { TransfersService } from '../connect/transfers.js';
 
@@ -15,12 +15,23 @@ export type ChargeStatus = 'pending' | 'succeeded' | 'underpaid' | 'overpaid' | 
 export type ChargeSource = 'api' | 'checkout' | 'invoice' | 'deposit';
 
 export type PaymentMethod =
-  | { readonly type: 'card'; readonly last4: string; readonly brand: string; readonly fingerprint: string }
+  | {
+      readonly type: 'card';
+      readonly last4: string;
+      readonly brand: string;
+      readonly fingerprint: string;
+      readonly expMonth?: number;
+      readonly expYear?: number;
+      readonly currency?: string;
+    }
   | {
       readonly type: 'bank_transfer';
       readonly senderName: string | null;
       readonly senderAccountNumber: string | null;
       readonly senderBankName: string | null;
+      readonly senderBankCode?: string | null;
+      readonly sessionId?: string | null;
+      readonly narration?: string | null;
     }
   | { readonly type: 'crypto'; readonly network: string | null; readonly asset: string | null }
   | { readonly type: 'mobile_money'; readonly phone: string | null; readonly provider: string | null };
@@ -32,6 +43,21 @@ export interface SettlementSplit {
   readonly amountMinor: bigint;
 }
 
+/** Processing fee rule, stored on the charge so it can be applied when the charge finalizes. */
+export interface FeeRule {
+  /** Basis points of the amount received (150 = 1.5%). */
+  readonly percentBps: number;
+  readonly flatMinor?: bigint;
+  readonly minMinor?: bigint | null;
+  readonly capMinor?: bigint | null;
+}
+
+export interface StatusChange {
+  readonly status: string;
+  readonly occurredAt: string;
+  readonly reason: string | null;
+}
+
 export interface Charge {
   readonly id: string;
   readonly ownerId: string;
@@ -41,9 +67,12 @@ export interface Charge {
   readonly subscriptionId: string | null;
   readonly virtualAccountId: string | null;
   readonly customerId: string | null;
+  readonly savedPaymentMethodId: string | null;
   readonly amount: Money;
   readonly amountReceived: Money;
   readonly amountRefunded: Money;
+  readonly processingFee: Money | null;
+  readonly feeRule: FeeRule | null;
   readonly status: ChargeStatus;
   readonly failureReason: FailureReason | null;
   readonly paymentMethod: PaymentMethod | null;
@@ -51,6 +80,7 @@ export interface Charge {
   readonly plannedOutcome: ScenarioOutcome;
   readonly delayApplied: boolean;
   readonly platformFee: Money | null;
+  /** Connected account id receiving a destination charge. */
   readonly transferDestination: string | null;
   readonly transferAmount: Money | null;
   readonly settlement: SettlementState;
@@ -58,6 +88,7 @@ export interface Charge {
   readonly description: string | null;
   readonly reference: string | null;
   readonly metadata: Metadata;
+  readonly statusHistory: readonly StatusChange[];
   readonly createdAt: string;
   readonly paidAt: string | null;
   readonly finalizedAt: string | null;
@@ -69,6 +100,8 @@ export interface CreateChargeInput {
   readonly amount: Money;
   readonly customerId?: string | null;
   readonly paymentMethod: PaymentMethod;
+  readonly savedPaymentMethodId?: string | null;
+  readonly feeRule?: FeeRule | null;
   readonly platformFee?: Money | null;
   readonly transferDestination?: string | null;
   readonly transferAmount?: Money | null;
@@ -92,6 +125,15 @@ export type ChargeFinalizedListener = (charge: Charge) => void;
 
 const FINALIZE_JOB = 'charge.finalize';
 const SETTLE_JOB = 'charge.settle';
+
+export function applyFeeRule(rule: FeeRule | null | undefined, received: Money): Money | null {
+  if (!rule) return null;
+  let fee = (received.amountMinor * BigInt(rule.percentBps)) / 10_000n + (rule.flatMinor ?? 0n);
+  if (rule.minMinor != null && fee < rule.minMinor) fee = rule.minMinor;
+  if (rule.capMinor != null && fee > rule.capMinor) fee = rule.capMinor;
+  if (fee > received.amountMinor) fee = received.amountMinor;
+  return money(fee, received.currency);
+}
 
 export class ChargesService {
   private readonly listeners: ChargeFinalizedListener[] = [];
@@ -123,11 +165,11 @@ export class ChargesService {
   chargeInvoice(input: CreateChargeInput & { readonly invoiceId: string; readonly subscriptionId: string }): Charge {
     const charge = this.build({ ...input, source: 'invoice', operation: 'subscription.renew' });
     this.ctx.store.put(C.charges, charge);
-    this.ctx.events.publish('charge.created', charge.ownerId, this.eventData(charge));
+    this.ctx.events.publish('charge.created', charge.ownerId, { charge });
     return this.applyOutcome(charge, charge.plannedOutcome);
   }
 
-  /** A bank deposit into a virtual account: succeeds at once. Held deposits keep funds pending. */
+  /** A bank deposit into a virtual account: succeeds at once. Held deposits go to the held bucket. */
   recordDeposit(input: {
     readonly ownerId: string;
     readonly amount: Money;
@@ -135,11 +177,12 @@ export class ChargesService {
     readonly customerId: string | null;
     readonly paymentMethod: PaymentMethod;
     readonly reference: string | null;
+    readonly feeRule?: FeeRule | null;
     readonly held: boolean;
   }): Charge {
     const charge = this.build({ ...input, source: 'deposit', operation: 'deposit.receive', outcomeOverride: { kind: 'succeed' } });
     this.ctx.store.put(C.charges, charge);
-    this.ctx.events.publish('charge.created', charge.ownerId, this.eventData(charge));
+    this.ctx.events.publish('charge.created', charge.ownerId, { charge });
     return this.applyOutcome(charge, { kind: 'succeed' }, { held: input.held });
   }
 
@@ -180,23 +223,17 @@ export class ChargesService {
   adjustRefunded(chargeId: string, delta: Money): Charge {
     const charge = this.ctx.store.get<Charge>(C.charges, chargeId);
     if (!charge) throw notFound('payment', chargeId);
-    const next: Charge = {
-      ...charge,
-      amountRefunded: money(charge.amountRefunded.amountMinor + delta.amountMinor, charge.amount.currency),
-      updatedAt: this.ctx.nowIso(),
-    };
-    this.ctx.store.put(C.charges, next);
-    return next;
+    return this.save({ ...charge, amountRefunded: money(charge.amountRefunded.amountMinor + delta.amountMinor, charge.amount.currency) });
   }
 
-  /** Releases funds of a held deposit into the available balance. */
+  /** Releases a held deposit into the available balance. Sends no event. */
   releaseHeld(chargeId: string): Charge {
     const charge = this.ctx.store.get<Charge>(C.charges, chargeId);
     if (!charge) throw notFound('payment', chargeId);
     if (charge.settlement !== 'held') throw new SandboxError('invalid_state', `Payment ${chargeId} is not held.`);
-    this.moveToAvailable(charge, 'release held deposit');
+    this.moveBucket(charge, 'held', 'available', 'release held deposit');
     const next = this.save({ ...charge, settlement: 'available' });
-    this.ctx.events.publish('deposit.released', next.ownerId, this.eventData(next));
+    this.ctx.events.publish('deposit.released', next.ownerId, { charge: next });
     return next;
   }
 
@@ -204,12 +241,17 @@ export class ChargesService {
     return subtractMoney(charge.amountReceived, charge.amountRefunded);
   }
 
+  /** Owner string for a connected account in the same provider as `owner`. */
+  accountOwner(owner: string, accountId: string): string {
+    return makeOwner(providerOf(owner), accountId);
+  }
+
   // ---------------------------------------------------------------------------
 
   private createPending(input: InternalCreate): Charge {
     const charge = this.build(input);
     this.ctx.store.put(C.charges, charge);
-    this.ctx.events.publish('charge.created', charge.ownerId, this.eventData(charge));
+    this.ctx.events.publish('charge.created', charge.ownerId, { charge });
     this.ctx.scheduler.schedule(FINALIZE_JOB, new Date(this.ctx.now().getTime() + this.ctx.config.chargeFinalizeDelayMs), { chargeId: charge.id }, {
       key: `charge-finalize:${charge.id}`,
     });
@@ -229,7 +271,7 @@ export class ChargesService {
     );
     const now = this.ctx.nowIso();
     return {
-      id: this.ctx.ids.next('ch'),
+      id: this.ctx.ids.entity('charge', input.ownerId),
       ownerId: input.ownerId,
       source: input.source,
       checkoutId: input.checkoutId ?? null,
@@ -237,9 +279,12 @@ export class ChargesService {
       subscriptionId: input.subscriptionId ?? null,
       virtualAccountId: input.virtualAccountId ?? null,
       customerId: input.customerId ?? null,
+      savedPaymentMethodId: input.savedPaymentMethodId ?? null,
       amount: input.amount,
       amountReceived: zero(input.amount.currency),
       amountRefunded: zero(input.amount.currency),
+      processingFee: null,
+      feeRule: input.feeRule ?? null,
       status: 'pending',
       failureReason: null,
       paymentMethod: input.paymentMethod,
@@ -253,6 +298,7 @@ export class ChargesService {
       description: input.description ?? null,
       reference: input.reference ?? null,
       metadata: input.metadata ?? {},
+      statusHistory: [{ status: 'pending', occurredAt: now, reason: null }],
       createdAt: now,
       paidAt: now,
       finalizedAt: null,
@@ -265,18 +311,21 @@ export class ChargesService {
     if (input.amount.amountMinor <= 0n) errors.push({ field: 'amount', message: 'Amount must be greater than zero.' });
     if (input.platformFee) {
       if (input.platformFee.currency !== input.amount.currency) errors.push({ field: 'platform_fee', message: 'Fee currency must match the charge.' });
-      else if (input.platformFee.amountMinor < 0n || compareMoney(input.platformFee, input.amount) > 0) {
-        errors.push({ field: 'platform_fee', message: 'Fee must be between zero and the charge amount.' });
+      else if (input.platformFee.amountMinor < 0n || compareMoney(input.platformFee, input.amount) >= 0) {
+        errors.push({ field: 'platform_fee', message: 'Fee must be less than the charge amount.' });
       }
-      if (input.ownerId === PLATFORM_OWNER && !input.transferDestination) {
+      if (isPlatformOwner(input.ownerId) && !input.transferDestination) {
         errors.push({ field: 'platform_fee', message: 'A platform fee needs a connected account (direct or destination charge).' });
       }
     }
-    if (input.transferAmount && (input.transferAmount.currency !== input.amount.currency || compareMoney(input.transferAmount, input.amount) > 0)) {
-      errors.push({ field: 'transfer_data.amount', message: 'Transfer amount must be in the charge currency and not exceed it.' });
+    if (input.transferAmount && (input.transferAmount.currency !== input.amount.currency || compareMoney(input.transferAmount, input.amount) >= 0)) {
+      errors.push({ field: 'transfer_data.amount', message: 'Transfer amount must be in the charge currency and less than it.' });
     }
-    if (input.transferDestination && !this.accounts.find(input.transferDestination)) {
-      errors.push({ field: 'transfer_data.destination', message: `No account found with id '${input.transferDestination}'.` });
+    if (input.transferDestination) {
+      const account = this.accounts.find(input.transferDestination);
+      if (!account || account.platformOwnerId !== platformOf(input.ownerId)) {
+        errors.push({ field: 'transfer_data.destination', message: `No account found with id '${input.transferDestination}'.` });
+      }
     }
     if (errors.length) throw validationFailed(errors);
   }
@@ -298,8 +347,14 @@ export class ChargesService {
   private applyOutcome(charge: Charge, outcome: ScenarioOutcome, options: { readonly held?: boolean } = {}): Charge {
     const finalizedAt = this.ctx.nowIso();
     if (outcome.kind === 'fail') {
-      const failed = this.save({ ...charge, status: 'failed', failureReason: outcome.reason, finalizedAt });
-      this.ctx.events.publish('charge.failed', failed.ownerId, this.eventData(failed));
+      const failed = this.save({
+        ...charge,
+        status: 'failed',
+        failureReason: outcome.reason,
+        finalizedAt,
+        statusHistory: [...charge.statusHistory, { status: 'failed', occurredAt: finalizedAt, reason: outcome.reason }],
+      });
+      this.ctx.events.publish('charge.failed', failed.ownerId, { charge: failed });
       this.notify(failed);
       return failed;
     }
@@ -310,31 +365,39 @@ export class ChargesService {
     }
     const comparison = compareMoney(received, charge.amount);
     const status: ChargeStatus = comparison < 0 ? 'underpaid' : comparison > 0 ? 'overpaid' : 'succeeded';
-    const { splits, settlement } = this.creditFunds(charge, received, options.held ?? false);
+    const processingFee = applyFeeRule(charge.feeRule, received);
+    const { splits, settlement } = this.creditFunds(charge, received, processingFee, options.held ?? false);
     const done = this.save({
       ...charge,
       status,
       amountReceived: received,
+      processingFee,
       settlement,
       settlementSplits: splits,
       finalizedAt,
+      statusHistory: [...charge.statusHistory, { status, occurredAt: finalizedAt, reason: null }],
     });
 
     if (status !== 'underpaid') this.recordConnectSideEffects(done, received);
-    this.ctx.events.publish(status === 'underpaid' ? 'charge.underpaid' : 'charge.succeeded', done.ownerId, this.eventData(done));
-    if (settlement === 'held') this.ctx.events.publish('deposit.held', done.ownerId, this.eventData(done));
+    this.ctx.events.publish(status === 'underpaid' ? 'charge.underpaid' : 'charge.succeeded', done.ownerId, { charge: done });
+    if (settlement === 'held') this.ctx.events.publish('deposit.held', done.ownerId, { charge: done });
     this.notify(done);
     return done;
   }
 
-  /** Posts the incoming money to the ledger, split between the charge owner and any connected party. */
-  private creditFunds(charge: Charge, received: Money, held: boolean): { splits: SettlementSplit[]; settlement: SettlementState } {
-    const splits = this.computeSplits(charge, received);
+  /** Posts the incoming money: processing fee to the provider, the rest split between owner and connected party. */
+  private creditFunds(charge: Charge, received: Money, fee: Money | null, held: boolean): { splits: SettlementSplit[]; settlement: SettlementState } {
+    const splits = this.computeSplits(charge, received, fee?.amountMinor ?? 0n);
     const live = this.ctx.config.fidelity === 'live' && charge.source !== 'deposit';
-    const bucket: BalanceBucket = held || live ? 'pending' : 'available';
+    const bucket: BalanceBucket = held ? 'held' : live ? 'pending' : 'available';
     const lines: LedgerLine[] = [{ account: ledgerAccounts.external(railFor(charge.paymentMethod)), direction: 'debit', amount: received }];
+    if (fee && fee.amountMinor > 0n) lines.push({ account: ledgerAccounts.external('provider_fees'), direction: 'credit', amount: fee });
     for (const split of splits) {
-      lines.push({ account: ledgerAccounts.balance(split.ownerId, bucket), direction: 'credit', amount: money(split.amountMinor, received.currency) });
+      lines.push({
+        account: ledgerAccounts.balance(split.ownerId, bucket),
+        direction: split.amountMinor >= 0n ? 'credit' : 'debit',
+        amount: money(split.amountMinor >= 0n ? split.amountMinor : -split.amountMinor, received.currency),
+      });
     }
     this.ctx.ledger.post({ description: `charge ${charge.id}`, reference: charge.id, lines });
 
@@ -348,54 +411,62 @@ export class ChargesService {
     return { splits, settlement: 'available' };
   }
 
-  private computeSplits(charge: Charge, received: Money): SettlementSplit[] {
+  /**
+   * Destination charge: the platform is merchant of record and bears the processing fee; the account
+   * gets the gross minus platform_fee (or exactly transfer_data.amount).
+   * Direct charge on an account: the account bears the processing fee and pays the platform fee.
+   */
+  private computeSplits(charge: Charge, received: Money, feeMinor: bigint): SettlementSplit[] {
     const total = received.amountMinor;
+    const platform = platformOf(charge.ownerId);
     if (charge.transferDestination) {
-      const toDestination = charge.transferAmount
-        ? charge.transferAmount.amountMinor
-        : total - (charge.platformFee?.amountMinor ?? 0n);
+      const destination = this.accountOwner(charge.ownerId, charge.transferDestination);
+      const toDestination = charge.transferAmount ? charge.transferAmount.amountMinor : total - (charge.platformFee?.amountMinor ?? 0n);
       const clamped = toDestination < 0n ? 0n : toDestination > total ? total : toDestination;
       return [
-        { ownerId: charge.ownerId, amountMinor: total - clamped },
-        { ownerId: charge.transferDestination, amountMinor: clamped },
-      ].filter((s) => s.amountMinor > 0n);
+        { ownerId: charge.ownerId, amountMinor: total - clamped - feeMinor },
+        { ownerId: destination, amountMinor: clamped },
+      ].filter((s) => s.amountMinor !== 0n);
     }
-    if (charge.platformFee && charge.ownerId !== PLATFORM_OWNER) {
-      const fee = charge.platformFee.amountMinor > total ? total : charge.platformFee.amountMinor;
+    if (charge.platformFee && !isPlatformOwner(charge.ownerId)) {
+      const platformFee = charge.platformFee.amountMinor > total ? total : charge.platformFee.amountMinor;
       return [
-        { ownerId: charge.ownerId, amountMinor: total - fee },
-        { ownerId: PLATFORM_OWNER, amountMinor: fee },
-      ].filter((s) => s.amountMinor > 0n);
+        { ownerId: charge.ownerId, amountMinor: total - platformFee - feeMinor },
+        { ownerId: platform, amountMinor: platformFee },
+      ].filter((s) => s.amountMinor !== 0n);
     }
-    return [{ ownerId: charge.ownerId, amountMinor: total }];
+    return [{ ownerId: charge.ownerId, amountMinor: total - feeMinor }];
   }
 
   private recordConnectSideEffects(charge: Charge, received: Money): void {
     if (charge.transferDestination) {
-      const split = charge.settlementSplits.find((s) => s.ownerId === charge.transferDestination);
-      if (split) this.transfers.recordFromCharge({ destination: charge.transferDestination, amount: money(split.amountMinor, received.currency), chargeId: charge.id });
+      const destinationOwner = this.accountOwner(charge.ownerId, charge.transferDestination);
+      // With platform_fee the transfer is recorded at the gross and the platform's cut is a separate fee record.
+      const amount = charge.transferAmount ?? received;
+      this.transfers.recordFromCharge({ fromOwner: charge.ownerId, toOwner: destinationOwner, amount, chargeId: charge.id });
       if (charge.platformFee && charge.platformFee.amountMinor > 0n) {
-        this.transfers.recordPlatformFee({ accountId: charge.transferDestination, chargeId: charge.id, amount: charge.platformFee });
+        this.transfers.recordPlatformFee({ platformOwner: charge.ownerId, collectedFrom: destinationOwner, chargeId: charge.id, amount: charge.platformFee });
       }
-    } else if (charge.platformFee && charge.platformFee.amountMinor > 0n && charge.ownerId !== PLATFORM_OWNER) {
-      this.transfers.recordPlatformFee({ accountId: charge.ownerId, chargeId: charge.id, amount: charge.platformFee });
+    } else if (charge.platformFee && charge.platformFee.amountMinor > 0n && !isPlatformOwner(charge.ownerId)) {
+      this.transfers.recordPlatformFee({ platformOwner: platformOf(charge.ownerId), collectedFrom: charge.ownerId, chargeId: charge.id, amount: charge.platformFee });
     }
   }
 
   private settle(chargeId: string): void {
     const charge = this.ctx.store.get<Charge>(C.charges, chargeId);
     if (!charge || charge.settlement !== 'pending') return;
-    this.moveToAvailable(charge, `settle charge ${charge.id}`);
+    this.moveBucket(charge, 'pending', 'available', `settle charge ${charge.id}`);
     const next = this.save({ ...charge, settlement: 'available' });
-    this.ctx.events.publish('charge.settled', next.ownerId, this.eventData(next));
+    this.ctx.events.publish('charge.settled', next.ownerId, { charge: next });
   }
 
-  private moveToAvailable(charge: Charge, description: string): void {
+  private moveBucket(charge: Charge, from: BalanceBucket, to: BalanceBucket, description: string): void {
     const lines: LedgerLine[] = [];
     for (const split of charge.settlementSplits) {
+      if (split.amountMinor <= 0n) continue;
       const amount = money(split.amountMinor, charge.amount.currency);
-      lines.push({ account: ledgerAccounts.balance(split.ownerId, 'pending'), direction: 'debit', amount });
-      lines.push({ account: ledgerAccounts.balance(split.ownerId, 'available'), direction: 'credit', amount });
+      lines.push({ account: ledgerAccounts.balance(split.ownerId, from), direction: 'debit', amount });
+      lines.push({ account: ledgerAccounts.balance(split.ownerId, to), direction: 'credit', amount });
     }
     this.ctx.ledger.post({ description, reference: charge.id, lines });
   }
@@ -408,10 +479,6 @@ export class ChargesService {
 
   private notify(charge: Charge): void {
     for (const listener of this.listeners) listener(charge);
-  }
-
-  eventData(charge: Charge): Record<string, unknown> {
-    return { charge };
   }
 }
 

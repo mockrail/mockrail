@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { DAY, money, parseDuration, PLATFORM_OWNER, Sandbox, SqliteStore, addInterval } from '../src/index.js';
+import { DAY, ledgerAccounts, money, parseDuration, platformOwner, Sandbox, SqliteStore, addInterval, zero } from '../src/index.js';
+
+const PLATFORM_OWNER = platformOwner('test');
+const AVAILABLE = ledgerAccounts.balance(PLATFORM_OWNER, 'available');
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -52,7 +55,7 @@ describe('ledger', () => {
     expect(() =>
       sb.ledger.post({ description: 'bad', lines: [{ account: 'a', direction: 'debit', amount: money(100n, 'NGN') }] }),
     ).toThrow(/Unbalanced/);
-    sb.ledger.move('external:card_network', 'owner:platform:available', money(2900n, 'NGN'), 'test');
+    sb.ledger.move('external:card_network', AVAILABLE, money(2900n, 'NGN'), 'test');
     expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'available', 'NGN')).toBe(2900n);
     expect(sb.ledger.trialBalance().get('NGN')).toBe(0n);
   });
@@ -69,12 +72,12 @@ describe('charges', () => {
     expect(charge.status).toBe('pending');
     await sb.clock.advanceBy({ milliseconds: 1_000 });
     expect(sb.charges.get(PLATFORM_OWNER, charge.id).status).toBe('succeeded');
-    expect(sb.ledger.balancesFor(PLATFORM_OWNER)).toEqual([{ currency: 'NGN', available: 500_00n, pending: 0n, reserved: 0n }]);
+    expect(sb.ledger.balancesFor(PLATFORM_OWNER)).toEqual([{ currency: 'NGN', available: 500_00n, pending: 0n, reserved: 0n, held: 0n }]);
   });
 
   it('splits a destination charge between platform and connected account', async () => {
     const sb = sandbox();
-    const account = sb.accounts.create({ capabilities: { card_payments: 'active' } });
+    const account = sb.accounts.create({ platformOwnerId: PLATFORM_OWNER, capabilities: { card_collection: { status: 'active', requested: true } } });
     sb.charges.create({
       ownerId: PLATFORM_OWNER,
       amount: money(10_000n, 'NGN'),
@@ -84,9 +87,9 @@ describe('charges', () => {
     });
     await sb.clock.advanceBy({ milliseconds: 1_000 });
     expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'available', 'NGN')).toBe(1_000n);
-    expect(sb.ledger.bucketBalance(account.id, 'available', 'NGN')).toBe(9_000n);
-    expect(sb.transfers.list()).toHaveLength(1);
-    expect(sb.transfers.listPlatformFees()).toHaveLength(1);
+    expect(sb.ledger.bucketBalance(sb.accounts.ownerOf(account), 'available', 'NGN')).toBe(9_000n);
+    expect(sb.transfers.list(PLATFORM_OWNER)).toHaveLength(1);
+    expect(sb.transfers.listPlatformFees(PLATFORM_OWNER)).toHaveLength(1);
   });
 
   it('keeps funds pending in live fidelity until settlement', async () => {
@@ -107,9 +110,9 @@ describe('subscription dunning', () => {
       ownerId: PLATFORM_OWNER,
       name: 'Pro',
       price: money(29_00n, 'USD'),
-      recurring: { interval: 'month', intervalCount: 1, trialDays: 0 },
+      recurring: { interval: 'month', intervalCount: 1, trial: null },
     });
-    const session = sb.checkout.create({ ownerId: PLATFORM_OWNER, productId: product.id, customerEmail: 'ada@example.com', expiresInMs: 60 * 60_000 });
+    const session = sb.checkout.create({ ownerId: PLATFORM_OWNER, lineItems: [{ productId: product.id }], customerEmail: 'ada@example.com', expiresInMs: 60 * 60_000 });
     sb.checkout.pay(session.id, { paymentMethod: { type: 'card', last4: '4242', brand: 'visa', fingerprint: 'x' } });
     await sb.clock.advanceBy({ milliseconds: 1_000 });
 
@@ -140,14 +143,14 @@ describe('subscription dunning', () => {
       ownerId: PLATFORM_OWNER,
       name: 'Trial',
       price: money(10_00n, 'USD'),
-      recurring: { interval: 'month', intervalCount: 1, trialDays: 14 },
+      recurring: { interval: 'month', intervalCount: 1, trial: { interval: 'day', intervalCount: 14 } },
     });
-    const session = sb.checkout.create({ ownerId: PLATFORM_OWNER, productId: product.id, customerEmail: 'a@b.co', expiresInMs: 60_000 });
+    const session = sb.checkout.create({ ownerId: PLATFORM_OWNER, lineItems: [{ productId: product.id }], customerEmail: 'a@b.co', expiresInMs: 60_000 });
     expect(session.amount.amountMinor).toBe(0n);
     const { checkout } = sb.checkout.pay(session.id, { paymentMethod: { type: 'card', last4: '4242', brand: 'visa', fingerprint: 'x' } });
     const subId = checkout.subscriptionId as string;
     expect(sb.subscriptions.get(PLATFORM_OWNER, subId).status).toBe('trialing');
-    await sb.subscriptions.endTrial(subId);
+    sb.subscriptions.endTrial(subId);
     expect(sb.subscriptions.get(PLATFORM_OWNER, subId).status).toBe('active');
     expect(sb.events.list({ type: 'invoice.paid' })).toHaveLength(1);
   });
@@ -156,8 +159,8 @@ describe('subscription dunning', () => {
 describe('payouts and refunds', () => {
   it('reserves funds, then completes or fails a payout', async () => {
     const sb = sandbox();
-    sb.ledger.move('external:card_network', 'owner:platform:available', money(100_000n, 'NGN'), 'seed');
-    const dest = sb.payouts.createDestination({ ownerId: PLATFORM_OWNER, type: 'bank', currency: 'NGN', bankCode: '999', accountNumber: '0001112223' });
+    sb.ledger.move('external:card_network', AVAILABLE, money(100_000n, 'NGN'), 'seed');
+    const dest = sb.payouts.createDestination({ ownerId: PLATFORM_OWNER, type: 'bank', currency: 'NGN', fundingCurrency: 'NGN', bankCode: '999', accountNumber: '0001112223', status: 'approved' });
     const payout = sb.payouts.create({ ownerId: PLATFORM_OWNER, destinationId: dest.id, amount: money(40_000n, 'NGN'), outcomeOverride: { kind: 'fail', reason: 'bank_rejected' } });
     expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'reserved', 'NGN')).toBe(40_000n);
     await sb.clock.advanceBy({ milliseconds: 60_000 });
@@ -167,9 +170,9 @@ describe('payouts and refunds', () => {
 
   it('rejects expired quotes', async () => {
     const sb = sandbox();
-    sb.ledger.move('external:card_network', 'owner:platform:available', money(100_000n, 'NGN'), 'seed');
-    const dest = sb.payouts.createDestination({ ownerId: PLATFORM_OWNER, type: 'bank', currency: 'NGN', bankCode: '999', accountNumber: '0001112223' });
-    const quote = sb.payouts.createQuote({ ownerId: PLATFORM_OWNER, amount: money(1_000n, 'NGN'), ttlMs: 30_000 });
+    sb.ledger.move('external:card_network', AVAILABLE, money(100_000n, 'NGN'), 'seed');
+    const dest = sb.payouts.createDestination({ ownerId: PLATFORM_OWNER, type: 'bank', currency: 'NGN', fundingCurrency: 'NGN', bankCode: '999', accountNumber: '0001112223', status: 'approved' });
+    const quote = sb.payouts.createQuote({ ownerId: PLATFORM_OWNER, fromAmount: money(1_000n, 'NGN'), toAmount: money(1_000n, 'NGN'), exchangeRate: '1', fee: zero('NGN'), ttlMs: 30_000 });
     await sb.clock.advanceBy({ milliseconds: 31_000 });
     expect(() => sb.payouts.create({ ownerId: PLATFORM_OWNER, destinationId: dest.id, quoteId: quote.id })).toThrow(/expired/);
   });
@@ -178,20 +181,21 @@ describe('payouts and refunds', () => {
     const sb = sandbox();
     const charge = sb.charges.create({ ownerId: PLATFORM_OWNER, amount: money(1_000n, 'NGN'), paymentMethod: { type: 'card', last4: '4242', brand: 'visa', fingerprint: 'x' } });
     await sb.clock.advanceBy({ milliseconds: 1_000 });
-    sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(600n, 'NGN'), allowDepositRefunds: true });
-    sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(400n, 'NGN'), allowDepositRefunds: true });
-    expect(() => sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(1n, 'NGN'), allowDepositRefunds: true })).toThrow();
+    sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(600n, 'NGN'), allowBankTransferRefunds: true });
+    sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(400n, 'NGN'), allowBankTransferRefunds: true });
+    expect(() => sb.refunds.create({ ownerId: PLATFORM_OWNER, chargeId: charge.id, amount: money(1n, 'NGN'), allowBankTransferRefunds: true })).toThrow();
   });
 });
 
 describe('virtual account deposits', () => {
   it('holds deposits above the limit and releases them without an event', () => {
     const sb = sandbox();
-    const va = sb.virtualAccounts.create({ ownerId: PLATFORM_OWNER, currency: 'NGN', bankName: 'Test Bank', numberPrefix: '90', numberLength: 10, perDepositLimitMinor: 1_000n, dailyLimitMinor: 1_000n });
-    expect(sb.virtualAccounts.create({ ownerId: PLATFORM_OWNER, currency: 'NGN', bankName: 'Test Bank', numberPrefix: '90', numberLength: 10 }).accountNumber).toBe(va.accountNumber);
+    const va = sb.virtualAccounts.create({ ownerId: PLATFORM_OWNER, currency: 'NGN', bankName: 'Test Bank', numberPrefix: '90', numberLength: 10, perDepositLimitMinor: 1_000n, dailyLimitMinor: 1_000n }).account;
+    expect(sb.virtualAccounts.create({ ownerId: PLATFORM_OWNER, currency: 'NGN', bankName: 'Test Bank', numberPrefix: '90', numberLength: 10 }).account.accountNumber).toBe(va.accountNumber);
     const held = sb.virtualAccounts.simulateDeposit({ accountNumber: va.accountNumber, amount: money(5_000n, 'NGN') });
     expect(held.settlement).toBe('held');
-    expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'pending', 'NGN')).toBe(5_000n);
+    expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'held', 'NGN')).toBe(5_000n);
+    expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'pending', 'NGN')).toBe(0n);
     sb.charges.releaseHeld(held.id);
     expect(sb.ledger.bucketBalance(PLATFORM_OWNER, 'available', 'NGN')).toBe(5_000n);
   });
@@ -204,7 +208,7 @@ describe('stores', () => {
       const path = join(dir, 'state.db');
       const first = new Sandbox({ store: new SqliteStore(path), frozenAt: T0 });
       const customer = first.customers.create({ ownerId: PLATFORM_OWNER, email: 'persist@example.com' });
-      first.ledger.move('external:card_network', 'owner:platform:available', money(123n, 'NGN'), 'seed');
+      first.ledger.move('external:card_network', AVAILABLE, money(123n, 'NGN'), 'seed');
       first.close();
       const second = new Sandbox({ store: new SqliteStore(path) });
       expect(second.customers.get(PLATFORM_OWNER, customer.id).email).toBe('persist@example.com');

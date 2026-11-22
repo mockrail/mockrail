@@ -2,20 +2,27 @@ import { byNewest, C } from '../shared/collections.js';
 import type { CoreContext } from '../shared/context.js';
 import { notFound, validationFailed } from '../shared/errors.js';
 import type { Metadata } from '../shared/json.js';
-import { PLATFORM_OWNER } from '../shared/owners.js';
+import { ownerId, providerOf } from '../shared/owners.js';
 
-export type CapabilityStatus = 'active' | 'inactive' | 'pending';
+export type CapabilityStatus = 'active' | 'pending' | 'restricted' | 'inactive' | 'unrequested' | 'unsupported';
+
+export interface Capability {
+  readonly status: CapabilityStatus;
+  readonly requested: boolean;
+  readonly international?: boolean;
+}
 
 export interface ConnectedAccount {
   readonly id: string;
-  readonly type: string;
+  /** Owner string of the platform that created the account. */
+  readonly platformOwnerId: string;
   readonly email: string | null;
   readonly country: string | null;
-  readonly businessName: string | null;
-  readonly businessType: string | null;
-  readonly defaultCurrency: string | null;
-  readonly capabilities: Readonly<Record<string, CapabilityStatus>>;
+  readonly displayName: string | null;
+  readonly capabilities: Readonly<Record<string, Capability>>;
   readonly requirementsDue: readonly string[];
+  /** Provider-specific profile fields, owned by the adapter (dashboard mode, entity type, ...). */
+  readonly attributes: Readonly<Record<string, unknown>>;
   readonly metadata: Metadata;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -28,8 +35,7 @@ export interface Person {
   readonly lastName: string | null;
   readonly email: string | null;
   readonly phone: string | null;
-  readonly roles: readonly string[];
-  readonly metadata: Metadata;
+  readonly attributes: Readonly<Record<string, unknown>>;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -38,41 +44,49 @@ export interface AccountDocument {
   readonly id: string;
   readonly accountId: string;
   readonly personId: string | null;
-  readonly purpose: string;
+  readonly slot: string;
+  readonly fileId: string | null;
   readonly fileName: string | null;
   readonly createdAt: string;
 }
 
 export interface AccountLink {
-  readonly kind: 'onboarding' | 'login' | 'dashboard_invite';
+  readonly id: string;
+  readonly kind: string;
   readonly accountId: string;
   readonly url: string;
   readonly expiresAt: string;
   readonly createdAt: string;
+  readonly supersededPrevious: boolean;
 }
 
 export interface CreateAccountInput {
-  readonly type?: string;
+  readonly platformOwnerId: string;
   readonly email?: string | null;
   readonly country?: string | null;
-  readonly businessName?: string | null;
-  readonly businessType?: string | null;
-  readonly defaultCurrency?: string | null;
+  readonly displayName?: string | null;
   /** Final capability map, already decided by the adapter (sandboxes may over-grant). */
-  readonly capabilities: Readonly<Record<string, CapabilityStatus>>;
+  readonly capabilities: Readonly<Record<string, Capability>>;
   readonly requirementsDue?: readonly string[];
+  readonly attributes?: Readonly<Record<string, unknown>>;
   readonly metadata?: Metadata;
 }
 
-export type UpdateAccountInput = Partial<Omit<CreateAccountInput, 'capabilities'>>;
+export interface UpdateAccountInput {
+  readonly email?: string | null;
+  readonly country?: string | null;
+  readonly displayName?: string | null;
+  readonly requirementsDue?: readonly string[];
+  readonly attributes?: Readonly<Record<string, unknown>>;
+  readonly metadata?: Metadata;
+}
 
 export interface PersonInput {
   readonly firstName?: string | null;
   readonly lastName?: string | null;
   readonly email?: string | null;
   readonly phone?: string | null;
-  readonly roles?: readonly string[];
-  readonly metadata?: Metadata;
+  readonly attributes?: Readonly<Record<string, unknown>>;
 }
 
 export class AccountsService {
@@ -81,33 +95,39 @@ export class AccountsService {
   create(input: CreateAccountInput): ConnectedAccount {
     const now = this.ctx.nowIso();
     const account: ConnectedAccount = {
-      id: this.ctx.ids.next('acct'),
-      type: input.type ?? 'standard',
+      id: this.ctx.ids.entity('account', input.platformOwnerId),
+      platformOwnerId: input.platformOwnerId,
       email: input.email ?? null,
       country: input.country ?? null,
-      businessName: input.businessName ?? null,
-      businessType: input.businessType ?? null,
-      defaultCurrency: input.defaultCurrency ?? null,
+      displayName: input.displayName ?? null,
       capabilities: input.capabilities,
       requirementsDue: input.requirementsDue ?? [],
+      attributes: input.attributes ?? {},
       metadata: input.metadata ?? {},
       createdAt: now,
       updatedAt: now,
     };
     this.ctx.store.put(C.accounts, account);
-    this.ctx.events.publish('account.created', account.id, { account });
-    for (const [capability, status] of Object.entries(account.capabilities)) {
-      this.ctx.events.publish('capability.updated', account.id, { account, capability, status, previousStatus: null });
+    const owner = this.ownerOf(account);
+    this.ctx.events.publish('account.created', owner, { account });
+    for (const [capability, value] of Object.entries(account.capabilities)) {
+      this.ctx.events.publish('capability.updated', owner, { account, capability, ...value, previousStatus: null });
     }
     if (account.requirementsDue.length) {
-      this.ctx.events.publish('account.tasks_requested', account.id, { account, tasks: account.requirementsDue });
+      this.ctx.events.publish('account.tasks_requested', owner, { account, tasks: account.requirementsDue });
     }
     return account;
   }
 
-  get(id: string): ConnectedAccount {
+  /** Owner string for resources owned by this account. */
+  ownerOf(account: Pick<ConnectedAccount, 'id' | 'platformOwnerId'>): string {
+    return ownerId(providerOf(account.platformOwnerId), account.id);
+  }
+
+  /** Account belonging to this platform, or a not-found error. */
+  get(platformOwnerId: string, id: string): ConnectedAccount {
     const account = this.ctx.store.get<ConnectedAccount>(C.accounts, id);
-    if (!account) throw notFound('account', id);
+    if (!account || account.platformOwnerId !== platformOwnerId) throw notFound('account', id);
     return account;
   }
 
@@ -115,77 +135,71 @@ export class AccountsService {
     return id ? this.ctx.store.get<ConnectedAccount>(C.accounts, id) ?? null : null;
   }
 
-  exists(id: string): boolean {
-    return id === PLATFORM_OWNER || this.find(id) !== null;
+  list(platformOwnerId: string): ConnectedAccount[] {
+    return this.ctx.store.list<ConnectedAccount>(C.accounts, (a) => a.platformOwnerId === platformOwnerId).sort(byNewest);
   }
 
-  list(): ConnectedAccount[] {
-    return this.ctx.store.list<ConnectedAccount>(C.accounts).sort(byNewest);
-  }
-
-  update(id: string, patch: UpdateAccountInput): ConnectedAccount {
-    const current = this.get(id);
+  update(platformOwnerId: string, id: string, patch: UpdateAccountInput): ConnectedAccount {
+    const current = this.get(platformOwnerId, id);
     const next: ConnectedAccount = {
       ...current,
-      ...definedOnly({
-        type: patch.type,
-        email: patch.email,
-        country: patch.country,
-        businessName: patch.businessName,
-        businessType: patch.businessType,
-        defaultCurrency: patch.defaultCurrency,
-        requirementsDue: patch.requirementsDue,
-      }),
+      ...(patch.email !== undefined ? { email: patch.email } : {}),
+      ...(patch.country !== undefined ? { country: patch.country } : {}),
+      ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
+      ...(patch.requirementsDue !== undefined ? { requirementsDue: patch.requirementsDue } : {}),
+      attributes: patch.attributes ? { ...current.attributes, ...patch.attributes } : current.attributes,
       metadata: patch.metadata ? { ...current.metadata, ...patch.metadata } : current.metadata,
       updatedAt: this.ctx.nowIso(),
     };
     this.ctx.store.put(C.accounts, next);
-    this.ctx.events.publish('account.updated', next.id, { account: next, previous: current });
+    this.ctx.events.publish('account.updated', this.ownerOf(next), { account: next, previous: current });
+    if (next.requirementsDue.some((r) => !current.requirementsDue.includes(r))) {
+      this.ctx.events.publish('account.tasks_requested', this.ownerOf(next), { account: next, tasks: next.requirementsDue.filter((r) => !current.requirementsDue.includes(r)) });
+    }
     return next;
   }
 
-  setCapability(id: string, capability: string, status: CapabilityStatus): ConnectedAccount {
-    const current = this.get(id);
-    const previousStatus = current.capabilities[capability] ?? null;
-    if (previousStatus === status) return current;
-    const next: ConnectedAccount = {
-      ...current,
-      capabilities: { ...current.capabilities, [capability]: status },
-      updatedAt: this.ctx.nowIso(),
-    };
+  setCapability(platformOwnerId: string, id: string, capability: string, value: Capability): ConnectedAccount {
+    const current = this.get(platformOwnerId, id);
+    const previous = current.capabilities[capability];
+    if (previous && previous.status === value.status && previous.requested === value.requested && previous.international === value.international) return current;
+    const next: ConnectedAccount = { ...current, capabilities: { ...current.capabilities, [capability]: value }, updatedAt: this.ctx.nowIso() };
     this.ctx.store.put(C.accounts, next);
-    this.ctx.events.publish('capability.updated', next.id, { account: next, capability, status, previousStatus });
-    this.ctx.events.publish('account.updated', next.id, { account: next, previous: current });
+    this.ctx.events.publish('capability.updated', this.ownerOf(next), { account: next, capability, ...value, previousStatus: previous?.status ?? null });
     return next;
   }
 
-  createLink(accountId: string, kind: AccountLink['kind'], ttlMs: number): AccountLink {
-    this.get(accountId);
+  createLink(platformOwnerId: string, accountId: string, kind: string, ttlMs: number): AccountLink {
+    this.get(platformOwnerId, accountId);
     const now = this.ctx.now();
-    const token = this.ctx.ids.secret('');
-    return {
+    const previous = this.ctx.store.list<AccountLink>(C.accountLinks, (l) => l.accountId === accountId && l.kind === kind);
+    for (const link of previous) this.ctx.store.delete(C.accountLinks, link.id);
+    const link: AccountLink = {
+      id: this.ctx.ids.entity('account_link', platformOwnerId),
       kind,
       accountId,
-      url: `${this.ctx.config.publicBaseUrl}/__sandbox/connect/${kind}/${accountId}?token=${token}`,
+      url: `${this.ctx.config.publicBaseUrl}/__sandbox/connect/${kind}/${accountId}?token=${this.ctx.ids.secret('')}`,
       expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
       createdAt: now.toISOString(),
+      supersededPrevious: previous.length > 0,
     };
+    this.ctx.store.put(C.accountLinks, link);
+    return link;
   }
 
   // Persons
 
-  addPerson(accountId: string, input: PersonInput): Person {
-    this.get(accountId);
+  addPerson(platformOwnerId: string, accountId: string, input: PersonInput): Person {
+    this.get(platformOwnerId, accountId);
     const now = this.ctx.nowIso();
     const person: Person = {
-      id: this.ctx.ids.next('person'),
+      id: this.ctx.ids.entity('person', platformOwnerId),
       accountId,
       firstName: input.firstName ?? null,
       lastName: input.lastName ?? null,
       email: input.email ?? null,
       phone: input.phone ?? null,
-      roles: input.roles ?? [],
-      metadata: input.metadata ?? {},
+      attributes: input.attributes ?? {},
       createdAt: now,
       updatedAt: now,
     };
@@ -193,46 +207,51 @@ export class AccountsService {
     return person;
   }
 
-  getPerson(accountId: string, personId: string): Person {
+  getPerson(platformOwnerId: string, accountId: string, personId: string): Person {
+    this.get(platformOwnerId, accountId);
     const person = this.ctx.store.get<Person>(C.persons, personId);
     if (!person || person.accountId !== accountId) throw notFound('person', personId);
     return person;
   }
 
-  listPersons(accountId: string): Person[] {
-    this.get(accountId);
+  listPersons(platformOwnerId: string, accountId: string): Person[] {
+    this.get(platformOwnerId, accountId);
     return this.ctx.store.list<Person>(C.persons, (p) => p.accountId === accountId).sort(byNewest);
   }
 
-  updatePerson(accountId: string, personId: string, patch: PersonInput): Person {
-    const current = this.getPerson(accountId, personId);
+  updatePerson(platformOwnerId: string, accountId: string, personId: string, patch: PersonInput): Person {
+    const current = this.getPerson(platformOwnerId, accountId, personId);
     const next: Person = {
       ...current,
-      ...definedOnly({ firstName: patch.firstName, lastName: patch.lastName, email: patch.email, phone: patch.phone, roles: patch.roles }),
-      metadata: patch.metadata ? { ...current.metadata, ...patch.metadata } : current.metadata,
+      ...(patch.firstName !== undefined ? { firstName: patch.firstName } : {}),
+      ...(patch.lastName !== undefined ? { lastName: patch.lastName } : {}),
+      ...(patch.email !== undefined ? { email: patch.email } : {}),
+      ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
+      attributes: patch.attributes ? { ...current.attributes, ...patch.attributes } : current.attributes,
       updatedAt: this.ctx.nowIso(),
     };
     this.ctx.store.put(C.persons, next);
     return next;
   }
 
-  removePerson(accountId: string, personId: string): Person {
-    const person = this.getPerson(accountId, personId);
+  removePerson(platformOwnerId: string, accountId: string, personId: string): Person {
+    const person = this.getPerson(platformOwnerId, accountId, personId);
     this.ctx.store.delete(C.persons, personId);
     return person;
   }
 
   // Documents
 
-  addDocument(accountId: string, input: { readonly purpose: string; readonly fileName?: string | null; readonly personId?: string | null }): AccountDocument {
-    this.get(accountId);
-    if (!input.purpose) throw validationFailed([{ field: 'purpose', message: 'Purpose is required.' }]);
-    if (input.personId) this.getPerson(accountId, input.personId);
+  addDocument(platformOwnerId: string, accountId: string, input: { readonly slot: string; readonly fileId?: string | null; readonly fileName?: string | null; readonly personId?: string | null }): AccountDocument {
+    this.get(platformOwnerId, accountId);
+    if (!input.slot) throw validationFailed([{ field: 'document', message: 'The document slot is required.' }]);
+    if (input.personId) this.getPerson(platformOwnerId, accountId, input.personId);
     const document: AccountDocument = {
-      id: this.ctx.ids.next('doc'),
+      id: this.ctx.ids.entity('document', platformOwnerId),
       accountId,
       personId: input.personId ?? null,
-      purpose: input.purpose,
+      slot: input.slot,
+      fileId: input.fileId ?? null,
       fileName: input.fileName ?? null,
       createdAt: this.ctx.nowIso(),
     };
@@ -245,8 +264,4 @@ export class AccountsService {
       .list<AccountDocument>(C.accountDocuments, (d) => d.accountId === accountId && (personId === undefined || d.personId === personId))
       .sort(byNewest);
   }
-}
-
-function definedOnly<T extends Record<string, unknown>>(value: T): Partial<T> {
-  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
 }

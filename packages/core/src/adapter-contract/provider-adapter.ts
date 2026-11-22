@@ -4,7 +4,9 @@ import type { CurrencyCode } from '../money/currency.js';
 import type { ScenarioOutcome } from '../scenarios/scenario-rule.js';
 import type { SandboxError } from '../shared/errors.js';
 import type { Sandbox } from '../sandbox.js';
-import type { AutoDisablePolicy } from '../webhooks/webhooks.js';
+import type { AutoDisablePolicy, SecretFormat } from '../webhooks/webhooks.js';
+import type { IdFormats } from '../shared/ids.js';
+import type { FeeRule } from '../charges/charges.js';
 
 export type ProviderId = string;
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
@@ -96,6 +98,11 @@ export interface ProviderWebhookEvent {
   readonly type: string;
   readonly ownerId: string;
   readonly createdAt: string;
+  /** The resource the event is about, for listing and replay lookups. */
+  readonly entityType?: string | null;
+  readonly entityId?: string | null;
+  /** Ids and references that find this event (e.g. replay by charge id or merchant reference). */
+  readonly references?: readonly string[];
   /** The full JSON body sent to the endpoint. */
   readonly body: Readonly<Record<string, unknown>>;
 }
@@ -117,6 +124,10 @@ export interface SimulatedPaymentInput {
 export interface SimulatedPayment {
   readonly paymentMethod: PaymentMethod;
   readonly outcomeOverride?: ScenarioOutcome;
+  /** Outcome of later charges on the saved method (test cards that save, then decline). */
+  readonly futureOutcome?: ScenarioOutcome;
+  /** Processing fee for this method. */
+  readonly feeRule?: FeeRule | null;
 }
 
 export interface TestCard {
@@ -127,6 +138,8 @@ export interface TestCard {
 export interface ProviderAdapter {
   readonly providerId: ProviderId;
   readonly displayName: string;
+  /** ID prefixes and formats for records this provider's owners create. */
+  readonly idPrefixes?: IdFormats;
   /** Documented sandbox test values, shown on the hosted checkout page. */
   readonly testCards?: readonly TestCard[];
   /** Maps hosted-checkout input to a payment method and (for test cards) a forced outcome. */
@@ -137,6 +150,8 @@ export interface ProviderAdapter {
   readonly rateLimit: RateLimitPolicy;
   readonly webhookSigner: WebhookSigner;
   readonly deliveryPolicy: DeliveryPolicy;
+  /** Format of generated endpoint signing secrets. */
+  readonly webhookSecretFormat?: SecretFormat;
   /** Header that carries the request id on every response. */
   readonly requestIdHeader: string;
   mapDomainEvent(event: DomainEvent, sandbox: Sandbox): readonly ProviderWebhookEvent[];
