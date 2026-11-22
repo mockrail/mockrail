@@ -17,7 +17,10 @@ export function renderCheckoutPage(input: {
   readonly testCards: readonly TestCard[];
 }): string {
   const { session } = input;
-  const amount = `${session.amount.currency} ${formatDecimal(session.amount.amountMinor, session.amount.currency)}`;
+  const [whole = '0', fraction] = formatDecimal(session.amount.amountMinor, session.amount.currency).split('.');
+  const grouped = `${whole.replace(/\B(?=(\d{3})+$)/g, ',')}${fraction !== undefined ? `.${fraction}` : ''}`;
+  const amount = `${session.amount.currency} ${grouped}`;
+  const free = session.amount.amountMinor === 0n;
   const title = session.lineItems.map((l) => (l.quantity > 1 ? `${l.productName} x${l.quantity}` : l.productName)).join(', ') || 'Payment';
   const methods = methodsFor(session.paymentMethodTypes);
   const trial = session.lineItems.find((l) => l.recurring?.trial)?.recurring?.trial;
@@ -73,7 +76,7 @@ export function renderCheckoutPage(input: {
       <label for="paid">Amount sent (${escape(session.amount.currency)}), leave empty for exact</label>
       <input id="paid" name="paid" inputmode="decimal" placeholder="${escape(formatDecimal(session.amount.amountMinor, session.amount.currency))}">
     </div>
-    <button class="pay" type="submit">Pay ${escape(amount)}</button>
+    <button class="pay" type="submit">${free ? (trial ? 'Start free trial' : 'Continue') : `Pay ${escape(amount)}`}</button>
   </form>
   <div id="result" role="status"></div>
   ${cards ? `<details><summary>Test cards</summary><ul>${cards}</ul><p>Any other number succeeds.</p></details>` : ''}`
