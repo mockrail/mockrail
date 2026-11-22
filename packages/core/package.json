@@ -1,0 +1,22 @@
+{
+  "name": "@mockrail/core",
+  "version": "0.1.0",
+  "description": "Provider-neutral payments simulation engine: ledger, virtual clock, scheduler, scenarios and domain modules.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit false"
+  },
+  "repository": { "type": "git", "url": "https://github.com/mockrail/mockrail", "directory": "packages/core" }
+}
