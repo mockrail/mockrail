@@ -3,7 +3,10 @@ import {
   notFound,
   parseDecimal,
   parseDuration,
-  PLATFORM_OWNER,
+  ownerId as makeOwner,
+  platformOwner,
+  providerOf,
+  type EndpointScope,
   SandboxError,
   type PaymentMethod,
   type ProviderAdapter,
@@ -55,6 +58,11 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
     jobs_run: results.length,
     failed: results.filter((r) => !r.ok).map((r) => ({ kind: r.kind, run_at: r.runAt, error: r.error })),
   });
+  /** Owner for `?provider=&account=` (defaults: first provider, its platform). */
+  const ownerFor = (q: Readonly<Record<string, unknown>>): string => {
+    const adapter = pickAdapter(q.provider);
+    return typeof q.account === 'string' && q.account ? makeOwner(adapter.providerId, q.account) : platformOwner(adapter.providerId);
+  };
   const pickAdapter = (providerId?: unknown): ProviderAdapter => {
     const adapter = typeof providerId === 'string' && providerId ? adapters.get(providerId) : adapters.values().next().value;
     if (!adapter) throw new SandboxError('bad_request', `Unknown provider '${String(providerId)}'. Loaded: ${[...adapters.keys()].join(', ')}.`);
@@ -169,15 +177,14 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
   on('GET', '/checkout/:id', ({ params, query }) => {
     const session = sandbox.checkout.find(params.id);
     if (!session) return { status: 404, html: '<!doctype html><title>Not found</title><p>Checkout session not found.</p>' };
-    const adapter = pickAdapter(query.provider);
-    const product = session.productId ? sandbox.products.get(session.ownerId, session.productId) : null;
-    return { html: renderCheckoutPage({ session, product, providerId: adapter.providerId, providerName: adapter.displayName, testCards: adapter.testCards ?? [] }) };
+    const adapter = pickAdapter(query.provider || providerOf(session.ownerId));
+    return { html: renderCheckoutPage({ session, providerId: adapter.providerId, providerName: adapter.displayName, testCards: adapter.testCards ?? [] }) };
   });
 
   on('POST', '/checkout/:id/pay', ({ params, body }) => {
     const session = sandbox.checkout.find(params.id);
     if (!session) throw notFound('checkout session', params.id ?? '');
-    const adapter = pickAdapter(body.provider);
+    const adapter = pickAdapter(body.provider || providerOf(session.ownerId));
     const method = (body.method ?? 'card') as PaymentMethod['type'];
     if (!['card', 'bank_transfer', 'crypto', 'mobile_money'].includes(method)) throw new SandboxError('bad_request', `Unknown payment method '${method}'.`);
     const paidMinor = body.amount_paid !== undefined && body.amount_paid !== '' ? parseDecimal(body.amount_paid, session.amount.currency) : undefined;
@@ -193,18 +200,27 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
       customerEmail: typeof body.email === 'string' ? body.email : null,
       customerName: typeof body.name === 'string' ? body.name : null,
       ...(simulated.outcomeOverride ? { outcomeOverride: simulated.outcomeOverride } : {}),
+      ...(simulated.futureOutcome ? { futureOutcome: simulated.futureOutcome } : {}),
+      ...(simulated.feeRule !== undefined ? { feeRule: simulated.feeRule } : {}),
     });
     return ok(result);
   });
 
   // Billing
 
-  on('POST', '/subscriptions/:id/end-trial', async ({ params }) => ok({ subscription: await sandbox.subscriptions.endTrial(params.id ?? '') }));
+  on('POST', '/subscriptions/:id/end-trial', ({ params }) => ok({ subscription: sandbox.subscriptions.endTrial(params.id ?? '') }));
+
+  /** Approve or reject a payout destination waiting for review (live fidelity). */
+  on('POST', '/payout-destinations/:id/review', ({ params, body }) => {
+    const decision = body.decision === 'rejected' ? 'rejected' : body.decision === 'approved' ? 'approved' : null;
+    if (!decision) throw new SandboxError('bad_request', 'decision must be "approved" or "rejected".');
+    return ok({ destination: sandbox.payouts.reviewDestination(params.id ?? '', decision, typeof body.reason === 'string' ? body.reason : null) });
+  });
 
   // Events and webhooks
 
   on('GET', '/events', ({ query }) =>
-    ok({ items: sandbox.events.list({ ...(query.type ? { type: query.type } : {}), ...(query.owner ? { ownerId: query.owner } : {}) }) }),
+    ok({ items: sandbox.events.list({ ...(query.type ? { type: query.type } : {}), ...(query.account || query.provider ? { ownerId: ownerFor(query) } : {}) }) }),
   );
 
   on('GET', '/webhooks/events', ({ query }) =>
@@ -224,7 +240,7 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
 
   on('GET', '/webhooks/endpoints', ({ query }) => {
     const providers = query.provider ? [query.provider] : [...adapters.keys()];
-    return ok({ items: providers.flatMap((p) => sandbox.webhooks.listEndpoints(p)) });
+    return ok({ items: providers.flatMap((p) => sandbox.webhooks.listEndpoints({ providerId: p })) });
   });
 
   /** Registers an endpoint without going through a provider's API (used by @mockrail/testing). */
@@ -232,10 +248,13 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
     const adapter = pickAdapter(body.provider);
     const endpoint = sandbox.webhooks.createEndpoint({
       providerId: adapter.providerId,
-      ownerId: PLATFORM_OWNER,
+      ownerId: platformOwner(adapter.providerId),
       url: String(body.url ?? ''),
       enabledEvents: Array.isArray(body.enabled_events) ? (body.enabled_events as string[]) : ['*'],
-      description: typeof body.description === 'string' ? body.description : 'registered via control plane',
+      name: typeof body.name === 'string' ? body.name : 'registered via control plane',
+      ...(adapter.webhookSecretFormat ? { secretFormat: adapter.webhookSecretFormat } : {}),
+      // Receives the platform's and its connected accounts' events unless told otherwise.
+      scope: ({ account: 'own', connect: 'connected', all: 'all' } as Record<string, EndpointScope>)[String(body.event_source ?? 'all')] ?? 'all',
     });
     return { status: 201, body: endpoint };
   });
@@ -260,11 +279,11 @@ export function createControlPlane(ctx: ControlContext): Router<Handler> {
 
   // Ledger
 
-  on('GET', '/balances', ({ query }) => ok({ owner: query.owner ?? PLATFORM_OWNER, balances: sandbox.ledger.balancesFor(query.owner ?? PLATFORM_OWNER) }));
+  on('GET', '/balances', ({ query }) => ok({ owner: ownerFor(query), balances: sandbox.ledger.balancesFor(ownerFor(query)) }));
 
   on('GET', '/ledger', ({ query }) =>
     ok({
-      entries: sandbox.ledger.entries({ ...(query.owner ? { ownerId: query.owner } : {}), ...(query.reference ? { reference: query.reference } : {}) }),
+      entries: sandbox.ledger.entries({ ...(query.account || query.provider ? { ownerId: ownerFor(query) } : {}), ...(query.reference ? { reference: query.reference } : {}) }),
       trial_balance: Object.fromEntries(sandbox.ledger.trialBalance()),
     }),
   );

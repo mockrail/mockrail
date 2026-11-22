@@ -1,4 +1,10 @@
-import { formatDecimal, type CheckoutSession, type Product, type TestCard } from '@mockrail/core';
+import { formatDecimal, type CheckoutSession, type TestCard } from '@mockrail/core';
+
+/** Provider corridor codes (e.g. NGN_BANK_TRANSFER) -> page payment methods. */
+function methodsFor(corridors: readonly string[]): string[] {
+  const methods = corridors.map((c) => (c.endsWith('_CARD') ? 'card' : c.endsWith('BANK_TRANSFER') ? 'bank_transfer' : c.startsWith('MOMO_') ? 'mobile_money' : c === 'CRYPTO' ? 'crypto' : c.toLowerCase()));
+  return methods.length ? [...new Set(methods)] : ['card'];
+}
 
 const escape = (s: string): string =>
   s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
@@ -6,15 +12,15 @@ const escape = (s: string): string =>
 /** Simulated hosted checkout page. Posts to the control plane, which pays the session. */
 export function renderCheckoutPage(input: {
   readonly session: CheckoutSession;
-  readonly product: Product | null;
   readonly providerId: string;
   readonly providerName: string;
   readonly testCards: readonly TestCard[];
 }): string {
-  const { session, product } = input;
+  const { session } = input;
   const amount = `${session.amount.currency} ${formatDecimal(session.amount.amountMinor, session.amount.currency)}`;
-  const title = product?.name ?? 'Payment';
-  const methods = session.paymentMethodTypes.length ? session.paymentMethodTypes : ['card'];
+  const title = session.lineItems.map((l) => (l.quantity > 1 ? `${l.productName} x${l.quantity}` : l.productName)).join(', ') || 'Payment';
+  const methods = methodsFor(session.paymentMethodTypes);
+  const trial = session.lineItems.find((l) => l.recurring?.trial)?.recurring?.trial;
   const cards = input.testCards
     .map((c) => `<li><button type="button" class="link" data-card="${escape(c.number)}">${escape(c.number)}</button> ${escape(c.description)}</li>`)
     .join('');
@@ -50,12 +56,13 @@ export function renderCheckoutPage(input: {
   <span class="badge">${escape(input.providerName)} sandbox &middot; mockrail</span>
   <h1>${escape(title)}</h1>
   <p class="amount">${escape(amount)}</p>
+  ${trial ? `<p>Free trial for ${trial.intervalCount} ${escape(trial.interval)}${trial.intervalCount > 1 ? 's' : ''}. Your card is saved, not charged.</p>` : ''}
   ${
     closed
       ? `<p>This checkout session is <strong>${escape(session.status)}</strong>.</p>`
       : `<form id="pay">
     <label for="email">Email</label>
-    <input id="email" name="email" type="email" value="${escape(session.customerEmail ?? '')}" placeholder="customer@example.com">
+    <input id="email" name="email" type="email" value="${escape(session.customerDetails?.email ?? session.customerEmail ?? '')}" placeholder="customer@example.com">
     <label for="method">Payment method</label>
     <select id="method" name="method">${methods.map((m) => `<option value="${escape(m)}">${escape(m.replace('_', ' '))}</option>`).join('')}</select>
     <div id="card-fields">

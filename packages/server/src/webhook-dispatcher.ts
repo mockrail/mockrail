@@ -1,12 +1,4 @@
-import type {
-  DeliveryKind,
-  DomainEvent,
-  ProviderAdapter,
-  ProviderWebhookEventRecord,
-  Sandbox,
-  WebhookDelivery,
-  WebhookEndpoint,
-} from '@mockrail/core';
+import { providerOf, type DeliveryKind, type DomainEvent, type ProviderAdapter, type ProviderWebhookEventRecord, type Sandbox, type WebhookDelivery, type WebhookEndpoint } from '@mockrail/core';
 import type { Logger } from './logger.js';
 
 export interface ChaosConfig {
@@ -24,12 +16,17 @@ export const NO_CHAOS: ChaosConfig = { duplicateRate: 0, dropRate: 0, delayMs: 0
 
 const DELIVER_JOB = 'webhook.deliver';
 
-export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<{ status: number }>;
+export interface FetchResult {
+  readonly status: number;
+  text?(): Promise<string>;
+}
+
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal }) => Promise<FetchResult>;
 
 /**
- * Turns domain events into provider webhooks: each adapter maps the event, the dispatcher stores
- * the provider event, then schedules one delivery job per subscribed endpoint on the virtual clock.
- * Retries follow the adapter's delivery policy, so advancing the clock runs them.
+ * Turns domain events into provider webhooks. Each event goes only to the adapter of the provider
+ * that owns it; the provider event is stored, then one delivery job per subscribed endpoint is
+ * scheduled on the virtual clock. Retries follow the adapter's policy, so advancing the clock runs them.
  */
 export class WebhookDispatcher {
   private chaos: ChaosConfig = NO_CHAOS;
@@ -48,7 +45,7 @@ export class WebhookDispatcher {
     this.sandbox.webhooks.setRedeliveryHandler((request) => {
       const event = this.sandbox.webhooks.findEvent(request.eventId);
       if (!event) return [];
-      return this.endpointsFor(event, request.endpointId).map((endpoint) => this.schedule(event, endpoint, 1, request.kind, 0));
+      return this.endpointsFor(event, request.endpointId).map((endpoint) => this.schedule(event, endpoint, request.kind, 0));
     });
   }
 
@@ -74,23 +71,27 @@ export class WebhookDispatcher {
   }
 
   private onDomainEvent(event: DomainEvent): void {
-    for (const adapter of this.adapters.values()) {
-      for (const mapped of adapter.mapDomainEvent(event, this.sandbox)) {
-        const record = this.sandbox.webhooks.recordEvent({
-          id: mapped.id,
-          providerId: adapter.providerId,
-          type: mapped.type,
-          ownerId: mapped.ownerId,
-          domainEventId: event.id,
-          body: mapped.body,
-          createdAt: mapped.createdAt,
-        });
-        for (const endpoint of this.endpointsFor(record)) {
-          const extra = this.chaos.delayMs + (this.chaos.reorderWindowMs > 0 ? this.sandbox.random.int(this.chaos.reorderWindowMs) : 0);
-          this.schedule(record, endpoint, 1, 'automatic', extra);
-          if (this.chaos.duplicateRate > 0 && this.sandbox.random.next() < this.chaos.duplicateRate) {
-            this.schedule(record, endpoint, 1, 'duplicate', extra + (this.chaos.reorderWindowMs > 0 ? this.sandbox.random.int(this.chaos.reorderWindowMs) : 0));
-          }
+    const adapter = this.adapters.get(providerOf(event.ownerId));
+    if (!adapter) return;
+    for (const mapped of adapter.mapDomainEvent(event, this.sandbox)) {
+      const record = this.sandbox.webhooks.recordEvent({
+        id: mapped.id,
+        providerId: adapter.providerId,
+        type: mapped.type,
+        ownerId: mapped.ownerId,
+        domainEventId: event.id,
+        entityType: mapped.entityType ?? null,
+        entityId: mapped.entityId ?? null,
+        references: mapped.references ?? [],
+        body: mapped.body,
+        createdAt: mapped.createdAt,
+      });
+      for (const endpoint of this.endpointsFor(record)) {
+        const jitter = (): number => (this.chaos.reorderWindowMs > 0 ? this.sandbox.random.int(this.chaos.reorderWindowMs) : 0);
+        const extra = this.chaos.delayMs + jitter();
+        this.schedule(record, endpoint, 'automatic', extra);
+        if (this.chaos.duplicateRate > 0 && this.sandbox.random.next() < this.chaos.duplicateRate) {
+          this.schedule(record, endpoint, 'duplicate', extra + jitter());
         }
       }
     }
@@ -98,27 +99,30 @@ export class WebhookDispatcher {
 
   private endpointsFor(event: ProviderWebhookEventRecord, endpointId?: string): WebhookEndpoint[] {
     return this.sandbox.webhooks
-      .listEndpoints(event.providerId)
-      .filter((e) => (endpointId ? e.id === endpointId : this.sandbox.webhooks.wantsEvent(e, event.type)));
+      .listEndpoints({ providerId: event.providerId })
+      .filter((e) => (endpointId ? e.id === endpointId && e.status === 'enabled' : this.sandbox.webhooks.wantsEvent(e, event)));
   }
 
-  private schedule(event: ProviderWebhookEventRecord, endpoint: WebhookEndpoint, attempt: number, kind: DeliveryKind, delayMs: number): WebhookDelivery {
+  private schedule(event: ProviderWebhookEventRecord, endpoint: WebhookEndpoint, kind: DeliveryKind, delayMs: number, attempt?: number): WebhookDelivery {
     const now = this.sandbox.clock.now();
     const runAt = new Date(now.getTime() + delayMs);
     const delivery = this.sandbox.webhooks.saveDelivery({
-      id: this.sandbox.ids.next('whd'),
+      id: this.sandbox.ids.entity('webhook_attempt', endpoint.ownerId),
       providerId: event.providerId,
       eventId: event.id,
       endpointId: endpoint.id,
-      attempt,
+      url: endpoint.url,
+      attempt: attempt ?? this.sandbox.webhooks.nextAttemptNumber(event.id, endpoint.id),
       kind,
       status: 'scheduled',
       responseStatus: null,
+      responseSnippet: null,
       error: null,
       durationMs: null,
       scheduledFor: runAt.toISOString(),
       attemptedAt: null,
       createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
     });
     this.sandbox.scheduler.schedule(DELIVER_JOB, runAt, { deliveryId: delivery.id });
     return delivery;
@@ -132,11 +136,11 @@ export class WebhookDispatcher {
     const endpoint = this.sandbox.webhooks.findEndpoint(delivery.endpointId);
     const attemptedAt = this.sandbox.clock.now().toISOString();
     if (!adapter || !event || !endpoint || endpoint.status !== 'enabled') {
-      this.sandbox.webhooks.saveDelivery({ ...delivery, status: 'failed', error: 'endpoint missing or disabled', attemptedAt });
+      this.sandbox.webhooks.saveDelivery({ ...delivery, status: 'failed', error: 'Endpoint deleted or disabled', attemptedAt });
       return;
     }
     if (delivery.kind === 'automatic' && this.chaos.dropRate > 0 && this.sandbox.random.next() < this.chaos.dropRate) {
-      this.sandbox.webhooks.saveDelivery({ ...delivery, status: 'dropped', error: 'dropped by chaos', attemptedAt });
+      this.sandbox.webhooks.saveDelivery({ ...delivery, status: 'dropped', error: 'Dropped by chaos', attemptedAt });
       this.logger.info(`webhook ${event.type} ${event.id} -> ${endpoint.url} dropped (chaos)`);
       return;
     }
@@ -145,13 +149,10 @@ export class WebhookDispatcher {
     const rawBody = JSON.stringify(event.body);
     // Signatures use wall-clock time so receivers' timestamp tolerance checks pass even after the
     // virtual clock has been advanced. The envelope's created_at stays on virtual time.
-    const signatureHeaders = adapter.webhookSigner.sign({
-      rawBody,
-      timestamp: new Date(),
-      secrets: this.sandbox.webhooks.activeSecrets(endpoint),
-    });
+    const signatureHeaders = adapter.webhookSigner.sign({ rawBody, timestamp: new Date(), secrets: this.sandbox.webhooks.activeSecrets(endpoint) });
     const started = Date.now();
     let status: number | undefined;
+    let snippet: string | null = null;
     let error: string | undefined;
     try {
       const response = await this.fetchImpl(endpoint.url, {
@@ -161,20 +162,15 @@ export class WebhookDispatcher {
         signal: AbortSignal.timeout(policy.timeoutMs),
       });
       status = response.status;
+      snippet = response.text ? (await response.text().catch(() => '')).slice(0, 500) : null;
     } catch (err) {
       const name = (err as { name?: string })?.name;
-      error = name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'connection_error';
+      error = name === 'TimeoutError' || name === 'AbortError' ? `Connection timed out after ${Math.round(policy.timeoutMs / 1000)}s` : 'Connection failed';
     }
     const durationMs = Date.now() - started;
     const succeeded = status !== undefined && policy.isSuccess(status);
-    this.sandbox.webhooks.saveDelivery({
-      ...delivery,
-      status: succeeded ? 'succeeded' : 'failed',
-      responseStatus: status ?? null,
-      error: error ?? null,
-      durationMs,
-      attemptedAt,
-    });
+    if (!succeeded && !error && status !== undefined) error = `Endpoint returned HTTP ${status}`;
+    this.sandbox.webhooks.saveDelivery({ ...delivery, status: succeeded ? 'succeeded' : 'failed', responseStatus: status ?? null, responseSnippet: snippet, error: error ?? null, durationMs, attemptedAt });
     this.logger.info(`webhook ${event.type} ${event.id} -> ${endpoint.url} attempt ${delivery.attempt} ${succeeded ? 'ok' : 'failed'} (${status ?? error}) ${durationMs}ms`);
 
     if (succeeded) {
@@ -186,10 +182,10 @@ export class WebhookDispatcher {
     if (health.disabled) this.logger.warn(`webhook endpoint ${endpoint.id} disabled: consecutive_failures`);
 
     // Resends, replays and duplicates are single attempts; automatic deliveries retry per policy.
-    const result = { ...(status !== undefined ? { status } : {}), ...(error ? { error } : {}) };
+    const result = { ...(status !== undefined ? { status } : {}), ...(error && status === undefined ? { error } : {}) };
     if (delivery.kind === 'automatic' && delivery.attempt < policy.maxAttempts && policy.isRetryable(result) && !health.disabled) {
       const wait = policy.retryDelaysMs[delivery.attempt - 1] ?? policy.retryDelaysMs[policy.retryDelaysMs.length - 1] ?? 60_000;
-      this.schedule(event, endpoint, delivery.attempt + 1, 'automatic', wait);
+      this.schedule(event, endpoint, 'automatic', wait, delivery.attempt + 1);
     }
   }
 }

@@ -70,6 +70,9 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     sandbox.scenarios.load(file);
   }
 
+  for (const adapter of adapters.values()) {
+    if (adapter.idPrefixes) sandbox.ids.registerProvider(adapter.providerId, adapter.idPrefixes);
+  }
   const dispatcher = new WebhookDispatcher(sandbox, adapters, logger, options.fetch);
   dispatcher.start();
   const rateLimiter = new RateLimiter();

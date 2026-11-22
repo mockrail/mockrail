@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   isSandboxError,
   parseDuration,
-  PLATFORM_OWNER,
+  platformOwner,
   SandboxError,
   type AdapterResponse,
   type HttpMethod,
@@ -49,7 +49,7 @@ export function createGateway(options: GatewayOptions): (req: IncomingMessage, r
   return (req, res) => {
     const started = Date.now();
     const url = new URL(req.url ?? '/', 'http://localhost');
-    const requestId = `req_${randomBytes(12).toString('hex')}`;
+    const requestId = randomUUID();
     const finish = (status: number): void => {
       if (options.logRequests) logger.info(`${req.method} ${url.pathname} ${status} ${Date.now() - started}ms ${requestId}`);
     };
@@ -132,10 +132,16 @@ export function createGateway(options: GatewayOptions): (req: IncomingMessage, r
 
       const actingHeader = adapter.auth.actingAccountHeader;
       const acting = actingHeader ? headers[actingHeader] : undefined;
-      if (acting && !sandbox.accounts.find(acting)) {
-        throw new SandboxError('bad_request', `No connected account '${acting}' to act as.`, { fieldErrors: [{ field: actingHeader ?? 'account', message: 'Unknown account.' }] });
+      const platform = platformOwner(adapter.providerId);
+      let ownerId = platform;
+      if (acting) {
+        // Unknown, foreign and non-child accounts all get the same 403 naming the header and id.
+        const account = sandbox.accounts.find(acting);
+        if (!account || account.platformOwnerId !== platform) {
+          throw new SandboxError('forbidden', `This key cannot act as the account in ${actingHeader}: ${acting}.`);
+        }
+        ownerId = sandbox.accounts.ownerOf(account);
       }
-      const ownerId = acting ?? PLATFORM_OWNER;
 
       const rawBody = method === 'GET' || method === 'DELETE' ? '' : await readRawBody(req);
       const body = parseJsonBody(rawBody, headers['content-type']);
