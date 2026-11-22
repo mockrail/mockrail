@@ -32,7 +32,8 @@ The virtual clock is the only source of domain time. On a running server it foll
 | `GET /events`, `GET /webhooks/events`, `GET /webhooks/deliveries`, `POST /webhooks/events/:id/replay` | Inspect and replay |
 | `POST /webhooks/endpoints {provider, url}` | Register a receiver without the provider API |
 | `GET/POST /webhooks/chaos {duplicate_rate, drop_rate, delay, reorder_window}` | Delivery chaos |
-| `GET /balances?owner=`, `GET /ledger` | Ledger views |
+| `GET /balances?provider=&account=`, `GET /ledger?provider=&account=` | Ledger views |
+| `POST /payout-destinations/:id/review {decision, reason}` | Approve or reject a destination waiting for review |
 | `POST /reset`, `POST /snapshots`, `POST /snapshots/:id/restore` | State |
 
 ## Scenarios
@@ -62,4 +63,6 @@ See [examples/scenarios.json](../../examples/scenarios.json).
 3. Keep every documented value in one constants file with its source page, and copy documented examples into `test/fixtures` as contract tests.
 4. Run it with `mockrail start --providers bachs,<name>`. Third-party packages load by package name.
 
-Known limitation: domain events are provider-neutral, so with two adapters loaded, each provider's endpoints also receive events for resources created through the other provider's API.
+### Providers are isolated
+
+Owners are provider-scoped (`<provider>:platform`, `<provider>:<account>`), so each loaded adapter behaves like a separate provider account: its own customers, balances, events and webhook endpoints. Adapters can set their own ID prefixes (`idPrefixes`) and secret format.

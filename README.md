@@ -15,10 +15,10 @@ pnpm start                 # same as: node packages/cli/dist/bin.js start
 ```bash
 curl -X POST http://127.0.0.1:4010/bachs/v1/checkout-sessions \
   -H "Authorization: Bearer sk_sandbox_local" -H "content-type: application/json" \
-  -d '{"amount":"2500.00","currency":"NGN","customer_email":"ada@example.com"}'
+  -d '{"pricing":{"currency":"NGN","amount":"2500.00"},"customer":{"email":"ada@example.com"}}'
 ```
 
-Open the returned `url` to pay on the simulated hosted checkout page, where the documented Bachs test cards are listed.
+Open the returned `checkout_url` to pay on the simulated hosted checkout page, where the documented Bachs test cards are listed.
 
 ## In a test suite
 
@@ -30,16 +30,18 @@ const api = sb.api('bachs');
 const hooks = await sb.webhooks();          // local receiver, registered for you
 
 const product = await api.post('/v1/products', {
-  name: 'Pro', price: '29.00', currency: 'USD', recurring: { interval: 'month' },
+  name: 'Pro', price: { currency: 'USD', amount: '29.00' }, billing_cycle: { interval: 'month', frequency: 1 },
 });
-const checkout = await api.post('/v1/checkout-sessions', { product_id: product.body.id, customer_email: 'a@b.co' });
-await sb.control.payCheckout(checkout.body.id);
+const checkout = await api.post('/v1/checkout-sessions', {
+  product_cart: [{ product_id: product.body.id }], customer: { email: 'a@b.co' },
+});
+await sb.control.payCheckout(checkout.body.checkout_id);
 await sb.advance('1s');
 
 await sb.control.addScenario({ match: { operation: 'subscription.renew' }, outcome: 'fail:insufficient_funds', uses: 'unlimited' });
 await sb.advance('31d');                    // renewal fails
 await sb.advance('10d');                    // retries at +1, +3, +5 days, then canceled
-await hooks.waitFor('subscription.canceled');
+await hooks.waitFor('customer.subscription.deleted');
 await sb.close();
 ```
 
