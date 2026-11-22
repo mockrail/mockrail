@@ -1,39 +1,50 @@
-# Bachs adapter: what is verified and what is not
+# Bachs adapter: verification notes
 
-Everything in `src/constants.ts` and `test/fixtures/documented.json` comes from Bachs doc pages opened on 21 Nov 2026. The items below are **best guesses**. Confirm each one against its doc page, then move it into the fixtures and add a contract test.
+The adapter was checked page by page against docs.bachs.io on 22 Nov 2026: the API reference, every webhook event page, the webhook endpoint API, and the checkout, payments, subscriptions, refunds, payouts, virtual-account and Connect guides. Documented values live in `src/constants.ts` and `test/fixtures/documented.json`.
 
-## Payload and object shapes not opened one by one
+This file lists what is **not** taken straight from the docs: sandbox choices, contradictions in the docs (with the side the adapter takes), and what is still unverified or not implemented.
 
-- Response objects for customers, products, subscriptions, invoices, refunds, payouts, quotes, destinations, accounts, persons, transfers and platform fees (`src/serializers.ts`). Only the documented conventions are certain: decimal-string money, ISO 8601 UTC timestamps, status words, and `available_balance`/`pending_balance`.
-- Webhook `data` for `payout.paid`, `payout.failed`, `checkout.expired`, `invoice.paid`, all `subscription.*` events, the `refund.*` events and the Connect events (`BACHS_EVENT_TYPES` marks these with `payloadVerified: false`).
-- Subscription event **names** (`subscription.created`, `subscription.updated`, `subscription.canceled`). The docs mention subscription events, but this review did not open them.
-- Request body field names on create and update endpoints (for example `product_id`, `customer_email`, `transfer_data`, `card.number`, `destination_id`).
+## Sandbox choices (not documented)
 
-## Paths and codes
-
-- Webhook admin paths (`/v1/webhooks/endpoints`, `/rotate-secret`, `/v1/webhooks/events/:id/resend`). Only `POST /v1/webhooks/replay` is listed verbatim.
-- Capability and person sub-routes under `/v1/accounts/:account_id`.
-- Error codes other than `BAD_REQUEST`, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_IN_PROGRESS` and `PAYOUT_RECIPIENT_INCOMPLETE` (see `ERROR_CODES[*].documented`).
-- `X-Bachs-Timestamp` is assumed to be in Unix **seconds**.
-- The rate-limit `X-RateLimit-Reset` value is assumed to be a Unix timestamp in seconds.
-
-## Discrepancy choices implemented (from the architecture doc)
-
-| # | Behaviour in this adapter |
+| Area | Choice |
 | --- | --- |
-| 1 | Uppercase status in webhooks, lowercase in API objects |
-| 2 | Only `GET /v1/payments/{payment_id}` is implemented |
-| 3 | `customer.customer_id` in checkout.completed; nullable `customer.id` in collection events |
-| 4 | Retries 1, 3 and 5 days after the preceding failure |
-| 5 | `invoice.payment_failed` carries the failed charge |
-| 6 | Status words and event names mapped as documented, no renaming |
-| 7 | Two decimals everywhere; free checkout amount is `"0"` |
-| 8 | Timestamps use `toISOString()` (`Z`, milliseconds). Per-field formats still need the examples |
-| 9 | Repeated partial refunds up to the remainder |
-| 10 | Both the `Idempotency-Key` header and the body `idempotency_key` are accepted |
-| 11 | Deposit refunds return `400 REFUND_NOT_ALLOWED` in live fidelity only |
-| 12 | `bank_transfer` in webhooks; `ngn_bank_transfer` in API objects and the payments filter |
-| 13 | Over-limit deposits fire `collection.succeeded` and the funds stay pending |
-| 14 | No webhook for transitions into `past_due` or for `unpaid` to `active` |
-| 15 | Checkout API status stays `open` (`exposeUndocumentedCheckoutStatuses` option to change) |
-| 16 | Not applicable yet (`GET /v1/currencies/supported` is not implemented) |
+| Exchange rates | Fixed rates per USD in `SANDBOX_USD_RATES` (e.g. NGN 1500). The docs show live rates only. |
+| NGN account resolution | NGN destinations resolve to `SANDBOX ACCOUNT HOLDER`, with the bank name from a small code table. |
+| Collection fees | Only documented fees apply: NGN bank transfer 1.5% (cap NGN 2,000), NGN cards 2%, virtual-account deposits 1% (cap NGN 300). USD cards, mobile money and crypto collect no fee. |
+| Payout fees | From the Fees page. The quote fee uses the same rules, taken before conversion (this matches the quote example: 100 USD gives 148,500 NGN at 1,500). |
+| Requirements | New accounts owe `company.registration_number` and `company.address` (or the `individual.*` equivalents). Sending them through `fields` clears them. |
+| Webhook URLs | HTTPS is required, as documented. The sandbox also accepts `http://localhost`. |
+| `organization_id` | The platform's account id is `acct_SandboxPlatform01` (set it with `createBachsAdapter({ organizationId })`). |
+| Customer-borne fees | `fee_bearer: customer` on charges (gross-up) is not modelled. The merchant always bears the fee. |
+
+## Contradictions in the docs, and the adapter's choice
+
+| # | Topic | Conflict | Adapter choice |
+| --- | --- | --- | --- |
+| 1 | Status casing | collection.* events use uppercase (SUCCEEDED, FAILED, UNDERPAID); payment objects use lowercase. | As documented in each place. |
+| 2 | Payment statuses | The statuses guide lists open/incomplete plus substatuses; PaymentResponse uses created/processing/succeeded/... | PaymentResponse enum (the API reference). A pending charge is `processing`. |
+| 3 | Customer shapes | Collection events use `customer.id`; other events use `customer_id`; customer.* events are flat. | Per event, as documented. |
+| 4 | Refund status words | Refund object: processing/success/failed and fee_bearer org/customer. refund.* events: processing/paid/failed and merchant/customer. | Each in its own place. |
+| 5 | One refund per charge | The guide says one refund per payment, but the refusal table says "ask for the remaining amount or less". | One non-failed refund per charge (409 CONFLICT otherwise). |
+| 6 | Deposit refunds | The refunds guide says bank transfers are not refundable; the earlier review found the sandbox does not block them. | Blocked in live fidelity only. |
+| 7 | invoice.paid `charge` | The example shows `charge: null`; the field is described as the collecting payment. | Filled whenever a charge was attempted. |
+| 8 | Subscription events | The lifecycle guide names no event for active to past_due; the updated-event page says any status transition fires it. | `customer.subscription.updated` on every status change (the event page). |
+| 9 | Fresh capability status | The capabilities guide says `restricted` (and that `pending` is unused); the update-account page says `pending`. | `restricted` in live. Sandbox grants `active`. |
+| 10 | Rotation overlap | The guide says the old secret stays valid 24 h; the rotate endpoint says it stops immediately. | 24 h overlap (guide). |
+| 11 | Rotate response | The guide says to store the new secret returned; the rotate schema has no `signing_secret`. | The response includes `signing_secret`. |
+| 12 | Connect event types | The overview lists account.updated etc.; the create-endpoint `event_types` enum omits them. | Accepted in `event_types`. |
+| 13 | Destination approval | The guide says banks and wallets are approved at once; the create example shows `pending_review`. | Sandbox approves at once. Live sends crypto wallets to review. |
+| 14 | List shapes | The intro says lists return `{items, pagination}`; refunds and payouts return `{total, items}`; webhook events return `{items, total, limit, offset}`. | Each endpoint as documented. |
+| 15 | List defaults | Pagination guide default 20; most list endpoints default 50; products 20. | Per endpoint. |
+| 16 | Customer on checkout | The object page says `customer` can be null; the GET schema says it is a required object. | Always an object, with null fields. |
+| 17 | Destination transfer amount | With platform_fee, the transfer is recorded at the gross, and the platform's cut is a separate fee record. | Recorded as documented; the seller's balance gets gross minus fee. |
+| 18 | Quote fee | "The quote carries no fee", but `to_amount` is net of the withdrawal fee. | Fee taken before conversion, so `to_amount` is net. |
+| 19 | Timestamps | Envelopes use `.000000+00:00`; nested fields use `Z`. | Envelope `created_at` in the +00:00 form; everything else ISO `Z`. |
+| 20 | checkout `payment_status` | Uses `canceled` (one l) while payments use `cancelled`. | Neither occurs in the sandbox (no cancel endpoint). |
+
+## Still unverified or not implemented
+
+- Pages not opened: `GET /v1/webhooks/endpoints/{id}/secret` (the response shape is a guess), the delete-destination response (204 assumed), list connected accounts and the remaining person routes (shapes reuse the add-person response).
+- Not implemented: disputes, files and uploads, customer portal sessions, balance settings, `/v1/accounts/me`, checkout settings, the reference lists, bank-account resolve, payment methods and rails, the currency lists, and the `conversion.*` and `dispute.*` events.
+- `payment_method.saved` is named in the saved-card guide but missing from the event index and the endpoint enum. The adapter emits it with the guide's fields.
+- Permissions and scopes (403 for a missing scope) are not modelled: every `sk_sandbox_` key has every scope.

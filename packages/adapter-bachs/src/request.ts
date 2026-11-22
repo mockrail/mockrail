@@ -1,6 +1,5 @@
 import {
   isCurrencyCode,
-  parseDecimal,
   SandboxError,
   validationFailed,
   type CurrencyCode,
@@ -8,6 +7,7 @@ import {
   type Metadata,
   type Money,
 } from '@mockrail/core';
+import { parseAmount } from './money.js';
 
 type Json = Record<string, unknown>;
 
@@ -101,7 +101,7 @@ export class BodyReader {
     }
     const upper = typeof value === 'string' ? value.toUpperCase() : value;
     if (!isCurrencyCode(upper)) {
-      this.fail(field, 'Unsupported currency. The sandbox supports NGN, USD, GHS, KES and ZAR.');
+      this.fail(field, 'Unsupported currency.');
       return undefined;
     }
     return upper;
@@ -115,7 +115,7 @@ export class BodyReader {
       return undefined;
     }
     if (!currency) return undefined;
-    const minor = parseDecimal(value, currency);
+    const minor = parseAmount(value, currency);
     if (minor === null) {
       this.fail(field, 'Must be a decimal string in the major unit with at most two decimal places, e.g. "29.00".');
       return undefined;

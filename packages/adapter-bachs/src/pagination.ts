@@ -16,43 +16,39 @@ export interface BachsList<T> {
   readonly pagination: BachsPagination;
 }
 
-function encodeCursor(offset: number): string {
-  return Buffer.from(JSON.stringify({ o: offset })).toString('base64url');
+interface Window {
+  readonly limit: number;
+  readonly offset: number;
 }
 
+/** Cursors look like `cur_<offset>` (the bad-cursor error message spells out the format). */
 function decodeCursor(cursor: string): number {
-  try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { o?: unknown };
-    if (typeof parsed.o === 'number' && Number.isInteger(parsed.o) && parsed.o >= 0) return parsed.o;
-  } catch {
-    // fall through
-  }
-  throw new SandboxError('bad_request', 'The cursor is invalid or has expired.');
+  const match = /^cur_(\d+)$/.exec(cursor);
+  if (!match) throw new SandboxError('bad_request', "Invalid cursor format. Expected 'cur_<offset>'.");
+  return Number(match[1]);
 }
 
-/**
- * Bachs pagination: `limit` defaults to 20 and is clamped to 100; `cursor` takes precedence over `offset`;
- * a bad cursor is 400 BAD_REQUEST.
- */
-export function paginate<T>(items: readonly T[], query: Readonly<Record<string, string>>): BachsList<T> {
-  const rawLimit = query.limit !== undefined ? Number(query.limit) : BACHS.defaultPageLimit;
-  if (!Number.isFinite(rawLimit)) throw new SandboxError('bad_request', 'limit must be a number.');
+/** limit is clamped to 1..100; cursor takes precedence over offset. */
+export function pageWindow(query: Readonly<Record<string, string>>, defaultLimit: number = BACHS.defaultPageLimit): Window {
+  const rawLimit = query.limit !== undefined && query.limit !== '' ? Number(query.limit) : defaultLimit;
+  if (!Number.isFinite(rawLimit)) throw new SandboxError('validation_failed', 'limit must be an integer.', { fieldErrors: [{ field: 'limit', message: 'Must be an integer.' }] });
   const limit = Math.min(Math.max(Math.trunc(rawLimit), 1), BACHS.maxPageLimit);
+  if (query.cursor) return { limit, offset: decodeCursor(query.cursor) };
+  const offset = query.offset !== undefined && query.offset !== '' ? Number(query.offset) : 0;
+  if (!Number.isInteger(offset) || offset < 0) throw new SandboxError('validation_failed', 'offset must be a non-negative integer.', { fieldErrors: [{ field: 'offset', message: 'Must be 0 or more.' }] });
+  return { limit, offset };
+}
 
-  let offset: number;
-  if (query.cursor) offset = decodeCursor(query.cursor);
-  else {
-    offset = query.offset !== undefined ? Number(query.offset) : 0;
-    if (!Number.isInteger(offset) || offset < 0) throw new SandboxError('bad_request', 'offset must be a non-negative integer.');
-  }
-
+/** `{ items, pagination }` lists. */
+export function paginate<T>(items: readonly T[], query: Readonly<Record<string, string>>, defaultLimit?: number): BachsList<T> {
+  const { limit, offset } = pageWindow(query, defaultLimit);
   const page = items.slice(offset, offset + limit);
   const hasMore = offset + page.length < items.length;
   return {
     items: page,
     pagination: {
-      next_cursor: hasMore ? encodeCursor(offset + page.length) : null,
-      prev_cursor: offset > 0 ? encodeCursor(Math.max(0, offset - limit)) : null,
+      next_cursor: hasMore ? `cur_${offset + page.length}` : null,
+      prev_cursor: offset > 0 ? `cur_${Math.max(0, offset - limit)}` : null,
       has_more: hasMore,
       limit,
       offset,
@@ -60,4 +56,16 @@ export function paginate<T>(items: readonly T[], query: Readonly<Record<string, 
       total: items.length,
     },
   };
+}
+
+/** `{ total, items }` lists (refunds, payouts). */
+export function totalList<T>(items: readonly T[], query: Readonly<Record<string, string>>, defaultLimit = 50): { total: number; items: readonly T[] } {
+  const { limit, offset } = pageWindow(query, defaultLimit);
+  return { total: items.length, items: items.slice(offset, offset + limit) };
+}
+
+/** `{ items, total, limit, offset }` lists (webhook events). */
+export function offsetList<T>(items: readonly T[], query: Readonly<Record<string, string>>, defaultLimit = 50): { items: readonly T[]; total: number; limit: number; offset: number } {
+  const { limit, offset } = pageWindow(query, defaultLimit);
+  return { items: items.slice(offset, offset + limit), total: items.length, limit, offset };
 }

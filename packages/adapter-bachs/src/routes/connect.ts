@@ -1,258 +1,378 @@
-import { MINUTE, PLATFORM_OWNER, SandboxError, type AdapterRequest, type CapabilityStatus, type ConnectedAccount, type PersonInput } from '@mockrail/core';
-import { AUTO_GRANTED_CAPABILITIES } from '../constants.js';
+import {
+  isPlatformOwner,
+  localOf,
+  MINUTE,
+  type AdapterRequest,
+  type Capability,
+  type ConnectedAccount,
+  type PersonInput,
+} from '@mockrail/core';
+import { CAPABILITIES } from '../constants.js';
+import { bachsError } from '../errors.js';
 import { BodyReader } from '../request.js';
-import { serializeAccount, serializeDocument, serializePerson, serializePlatformFee, serializeTransfer } from '../serializers.js';
-import { created, list, ok, route, type RouteFactory } from './helpers.js';
+import {
+  serializeAccount,
+  serializeAccountLink,
+  serializeCapabilityItem,
+  serializeDocument,
+  serializePerson,
+  serializePlatformFee,
+  serializeTransfer,
+} from '../view.js';
+import { created, list, ok, platformOwnerOf, route, viewOf, type RouteFactory } from './helpers.js';
 
-const REQUIRED_FIELDS = ['email', 'country', 'business_name'] as const;
+type Persona = keyof typeof CAPABILITIES;
+const PERSONAS = Object.keys(CAPABILITIES) as Persona[];
+const DASHBOARD_LEVEL = { none: 0, light: 1, full: 2 } as const;
 
-function requestedCapabilities(body: BodyReader): string[] {
-  const raw = body.raw('capabilities');
-  if (raw === undefined || raw === null) return [];
-  if (Array.isArray(raw) && raw.every((c) => typeof c === 'string')) return raw as string[];
-  if (typeof raw === 'object' && !Array.isArray(raw)) {
-    return Object.entries(raw as Record<string, unknown>)
-      .filter(([, v]) => v === true || (typeof v === 'object' && v !== null && (v as { requested?: unknown }).requested === true))
-      .map(([k]) => k);
-  }
-  body.fail('capabilities', 'Use an array of capability names or { name: { requested: true } }.');
-  return [];
+/** Connect management is a platform operation. */
+function platformOnly(req: AdapterRequest): string {
+  if (!isPlatformOwner(req.ownerId)) throw bachsError('FORBIDDEN', 403, 'This endpoint is only available to the platform, not while acting as an account.');
+  return req.ownerId;
 }
 
-function missingRequirements(account: Pick<ConnectedAccount, 'email' | 'country' | 'businessName'>): string[] {
-  const values: Record<(typeof REQUIRED_FIELDS)[number], string | null> = {
-    email: account.email,
-    country: account.country,
-    business_name: account.businessName,
-  };
-  return REQUIRED_FIELDS.filter((f) => !values[f]);
+function getAccount(req: AdapterRequest): ConnectedAccount {
+  const platform = platformOnly(req);
+  return req.sandbox.accounts.get(platform, req.params.account_id ?? '');
+}
+
+/** Requirements owed (sandbox owes the same fields as live). */
+function initialRequirements(entityType: string | null): string[] {
+  return entityType === 'company' ? ['company.registration_number', 'company.address'] : ['individual.dob', 'individual.address'];
+}
+
+/** Flattens `fields` ({ company: { registration_number } } or { "company.registration_number": ... }). */
+function flatten(value: unknown, prefix = ''): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return prefix ? { [prefix]: value } : {};
+  return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>((acc, [k, v]) => {
+    const key = prefix ? `${prefix}.${k}` : k;
+    return typeof v === 'object' && v !== null && !Array.isArray(v) && !key.endsWith('address') ? { ...acc, ...flatten(v, key) } : { ...acc, [key]: v };
+  }, {});
+}
+
+interface CapabilityRequest {
+  readonly name: string;
+  readonly requested: boolean;
+  readonly international?: boolean;
+}
+
+/** Parses `configuration: { merchant|recipient: { capabilities: { name: { requested, international } } } }`. */
+function readConfiguration(raw: unknown, onCreate: boolean): CapabilityRequest[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw bachsError('VALIDATION_ERROR', 400, 'configuration must be an object.', { field: 'configuration' });
+  const personas = Object.entries(raw as Record<string, unknown>);
+  if (!personas.length) throw bachsError('VALIDATION_ERROR', 422, 'configuration needs at least one of merchant or recipient.', { field: 'configuration' });
+  const out: CapabilityRequest[] = [];
+  for (const [persona, value] of personas) {
+    if (!PERSONAS.includes(persona as Persona)) throw bachsError('invalid_configuration', 400, `Unknown configuration '${persona}'. Use merchant or recipient.`, { field: 'configuration' });
+    const allowed = CAPABILITIES[persona as Persona] as readonly string[];
+    const caps = (value as { capabilities?: Record<string, { requested?: boolean; international?: boolean | null }> } | null)?.capabilities;
+    if (!caps) {
+      // Omitting capabilities on create requests every capability the configuration allows.
+      if (onCreate) for (const name of allowed) out.push({ name, requested: true });
+      continue;
+    }
+    for (const [name, opts] of Object.entries(caps)) {
+      const known = PERSONAS.some((p) => (CAPABILITIES[p] as readonly string[]).includes(name));
+      if (!known) throw bachsError('unknown_capability', 400, `Unknown capability '${name}'.`, { field: `configuration.${persona}.capabilities.${name}` });
+      if (!allowed.includes(name)) throw bachsError('capability_configuration_mismatch', 400, `'${name}' belongs to a different configuration.`, { field: `configuration.${persona}.capabilities.${name}` });
+      if (opts?.international != null && name !== 'payouts') throw bachsError('capability_option_not_supported', 400, `'international' only applies to payouts.`);
+      if (opts?.international === true && opts.requested === false) throw bachsError('VALIDATION_ERROR', 422, 'international: true cannot be combined with requested: false.');
+      out.push({ name, requested: opts?.requested ?? opts?.international === true, ...(opts?.international != null ? { international: opts.international } : {}) });
+    }
+  }
+  return out;
 }
 
 function readPerson(body: BodyReader): PersonInput {
   const firstName = body.nullableString('first_name');
   const lastName = body.nullableString('last_name');
   const email = body.nullableString('email');
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw bachsError('VALIDATION_ERROR', 422, 'Enter a valid email address.', { field: 'email' });
   const phone = body.nullableString('phone');
-  const roles = body.stringArray('roles');
-  const metadata = body.metadata();
+  if (phone && phone.length > 32) body.fail('phone', 'Must be at most 32 characters.');
+  const attributes: Record<string, unknown> = {};
+  for (const key of ['dob', 'address', 'relationship', 'id_numbers'] as const) {
+    const v = body.raw(key);
+    if (v !== undefined) attributes[key] = v;
+  }
+  if (body.raw('id_number') !== undefined || body.raw('id_numbers') !== undefined) attributes.id_number_provided = true;
   return {
     ...(firstName !== undefined ? { firstName } : {}),
     ...(lastName !== undefined ? { lastName } : {}),
     ...(email !== undefined ? { email } : {}),
     ...(phone !== undefined ? { phone } : {}),
-    ...(roles ? { roles } : {}),
-    ...(metadata ? { metadata } : {}),
+    ...(Object.keys(attributes).length ? { attributes } : {}),
   };
 }
 
-/** Connect management is a platform operation. */
-function platformOnly(req: AdapterRequest): void {
-  if (req.ownerId !== PLATFORM_OWNER) throw new SandboxError('forbidden', 'This endpoint is only available to the platform, not while acting as an account.');
-}
-
-function accountId(req: AdapterRequest): string {
-  platformOnly(req);
-  return req.params.account_id ?? '';
-}
-
-export const connectRoutes: RouteFactory = () => [
+export const connectRoutes: RouteFactory = (options) => [
   route('POST', '/v1/accounts', 'accounts.create', (req) => {
-    platformOnly(req);
+    const platform = platformOnly(req);
     const body = new BodyReader(req.body);
-    const fields = {
-      type: body.string('type') ?? 'standard',
-      email: body.string('email') ?? null,
-      country: body.string('country', { max: 2 }) ?? null,
-      businessName: body.string('business_name') ?? null,
-      businessType: body.string('business_type') ?? null,
-      defaultCurrency: body.string('default_currency') ?? null,
-    };
-    const requested = requestedCapabilities(body);
-    const metadata = body.metadata();
+    const email = body.string('contact_email', { required: true });
+    const displayName = body.nullableString('display_name');
+    const firstName = body.nullableString('first_name');
+    const lastName = body.nullableString('last_name');
+    const country = body.nullableString('country');
+    const entityType = body.oneOf('entity_type', ['company', 'individual'] as const);
+    const responsibilities = body.object('responsibilities');
+    const fees = responsibilities?.object('fees');
+    const feeCollector = fees?.oneOf('collector', ['platform', 'bachs'] as const) ?? 'bachs';
+    const dashboard = body.oneOf('dashboard', ['none', 'light', 'full'] as const) ?? 'none';
+    const dashboardFeatures = body.raw('dashboard_features');
+    const configurationRaw = body.raw('configuration');
     body.done();
+    const requests = readConfiguration(configurationRaw, true) ?? [];
 
     const live = req.sandbox.config.fidelity === 'live';
-    const missing = missingRequirements(fields);
-    const capabilities: Record<string, CapabilityStatus> = {};
+    const capabilities: Record<string, Capability> = {};
     if (live) {
-      // Live grants only what was named and blocks activation until required fields are supplied.
-      for (const name of requested) capabilities[name] = missing.length ? 'pending' : 'active';
+      // Live grants only what was named; a requested capability lands as restricted until checks pass.
+      for (const r of requests) capabilities[r.name] = { status: r.requested ? 'restricted' : 'unrequested', requested: r.requested, ...(r.international !== undefined ? { international: r.international } : {}) };
     } else {
-      // The official sandbox activates immediately and can grant more than was named.
-      for (const name of [...requested, ...AUTO_GRANTED_CAPABILITIES]) capabilities[name] = 'active';
+      // The sandbox grants the configuration's whole allowed set as active; recipients also get conversions.
+      const personas = Object.keys((configurationRaw as Record<string, unknown> | undefined) ?? {}) as Persona[];
+      for (const persona of personas) for (const name of CAPABILITIES[persona]) capabilities[name] = { status: 'active', requested: true };
+      for (const r of requests) capabilities[r.name] = { status: 'active', requested: true, ...(r.name === 'payouts' ? { international: r.international ?? true } : {}) };
+      if (personas.includes('recipient')) capabilities.conversions = { status: 'active', requested: true };
     }
+
     const account = req.sandbox.accounts.create({
-      ...fields,
+      platformOwnerId: platform,
+      email,
+      country: country?.toUpperCase() ?? null,
+      displayName: displayName ?? ([firstName, lastName].filter(Boolean).join(' ') || null),
       capabilities,
-      requirementsDue: live ? missing : [],
-      metadata: metadata ?? {},
+      requirementsDue: initialRequirements(entityType ?? null),
+      attributes: {
+        entity_type: entityType ?? null,
+        first_name: firstName ?? null,
+        last_name: lastName ?? null,
+        fee_collector: feeCollector,
+        dashboard,
+        dashboard_features: dashboardFeatures ?? undefined,
+        dashboard_access: 'not_invited',
+        configuration: configurationRaw ?? {},
+        balance_currencies: ['USD'],
+        fields: {},
+      },
     });
-    return created(serializeAccount(account));
+    return created(serializeAccount(viewOf(req, options), account, { single: true }));
   }),
 
   route('GET', '/v1/accounts', 'accounts.list', (req) => {
-    platformOnly(req);
-    return list(req, req.sandbox.accounts.list(), serializeAccount);
+    const view = viewOf(req, options);
+    return list(req, req.sandbox.accounts.list(platformOnly(req)), (a) => serializeAccount(view, a), 50);
   }),
 
-  route('GET', '/v1/accounts/:account_id', 'accounts.retrieve', (req) => ok(serializeAccount(req.sandbox.accounts.get(accountId(req))))),
+  route('GET', '/v1/accounts/:account_id', 'accounts.retrieve', (req) => ok(serializeAccount(viewOf(req, options), getAccount(req), { single: true }))),
 
+  /** Update is POST, not PATCH. */
   route('POST', '/v1/accounts/:account_id', 'accounts.update', (req) => {
-    const id = accountId(req);
+    const current = getAccount(req);
+    const platform = current.platformOwnerId;
+    const sandbox = req.sandbox;
     const body = new BodyReader(req.body);
-    const email = body.nullableString('email');
-    const country = body.nullableString('country');
-    const businessName = body.nullableString('business_name');
-    const businessType = body.nullableString('business_type');
-    const defaultCurrency = body.nullableString('default_currency');
-    const metadata = body.metadata();
+    const displayName = body.nullableString('display_name');
+    const email = body.nullableString('contact_email');
+    const dashboard = body.oneOf('dashboard', ['none', 'light', 'full'] as const);
+    const dashboardFeatures = body.raw('dashboard_features');
+    const fieldsRaw = body.raw('fields');
+    const balanceCurrencies = body.raw('balance_currencies');
+    const configurationRaw = body.raw('configuration');
     body.done();
-    let account = req.sandbox.accounts.update(id, {
-      ...(email !== undefined ? { email } : {}),
-      ...(country !== undefined ? { country } : {}),
-      ...(businessName !== undefined ? { businessName } : {}),
-      ...(businessType !== undefined ? { businessType } : {}),
-      ...(defaultCurrency !== undefined ? { defaultCurrency } : {}),
-      ...(metadata ? { metadata } : {}),
-    });
-    const missing = missingRequirements(account);
-    if (account.requirementsDue.length && !missing.length) {
-      account = req.sandbox.accounts.update(id, { requirementsDue: [] });
-      for (const [name, status] of Object.entries(account.capabilities)) {
-        if (status === 'pending') account = req.sandbox.accounts.setCapability(id, name, 'active');
+    const attrs = current.attributes as Record<string, unknown>;
+
+    if (dashboard && DASHBOARD_LEVEL[dashboard] < DASHBOARD_LEVEL[(attrs.dashboard as keyof typeof DASHBOARD_LEVEL) ?? 'none']) {
+      throw bachsError('dashboard_cannot_be_lowered', 400, 'The dashboard mode cannot be lowered.', { field: 'dashboard' });
+    }
+    const fields = { ...((attrs.fields as Record<string, unknown>) ?? {}), ...flatten(fieldsRaw) };
+    const address = fields['company.address'] ?? fields['individual.address'] ?? attrs.address;
+    let currencies = (attrs.balance_currencies as string[] | undefined) ?? ['USD'];
+    if (balanceCurrencies && typeof balanceCurrencies === 'object') {
+      for (const [code, held] of Object.entries(balanceCurrencies as Record<string, boolean>)) {
+        currencies = held ? [...new Set([...currencies, code.toUpperCase()])] : currencies.filter((c) => c !== code.toUpperCase() || c === 'USD');
       }
     }
-    return ok(serializeAccount(account));
+    const due = current.requirementsDue.filter((r) => fields[r] === undefined || fields[r] === null || fields[r] === '');
+
+    let account = sandbox.accounts.update(platform, current.id, {
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(email !== undefined ? { email } : {}),
+      requirementsDue: due,
+      attributes: {
+        fields,
+        balance_currencies: currencies,
+        ...(address ? { address } : {}),
+        ...(dashboard ? { dashboard } : {}),
+        ...(dashboardFeatures !== undefined ? { dashboard_features: dashboardFeatures } : {}),
+      },
+    });
+
+    const live = sandbox.config.fidelity === 'live';
+    for (const r of readConfiguration(configurationRaw, false) ?? []) {
+      const existing = account.capabilities[r.name];
+      if (!r.requested) {
+        if (existing?.status === 'active') throw bachsError('capability_active', 400, `'${r.name}' is active and cannot be withdrawn.`);
+        account = sandbox.accounts.setCapability(platform, account.id, r.name, { status: 'unrequested', requested: false });
+        continue;
+      }
+      // The sandbox grants only the capabilities named in an update.
+      const status = live ? (due.length ? 'restricted' : 'active') : 'active';
+      account = sandbox.accounts.setCapability(platform, account.id, r.name, { status, requested: true, ...(r.international !== undefined ? { international: r.international } : existing?.international !== undefined ? { international: existing.international } : {}) });
+    }
+    // Live: once nothing is owed, restricted capabilities go active.
+    if (live && !due.length) {
+      for (const [name, c] of Object.entries(account.capabilities)) {
+        if (c.status === 'restricted' && c.requested) account = sandbox.accounts.setCapability(platform, account.id, name, { ...c, status: 'active' });
+      }
+    }
+    return ok(serializeAccount(viewOf(req, options), account, { single: true }));
   }),
 
   route('POST', '/v1/accounts/:account_id/account-links', 'accounts.links.create', (req) => {
-    const link = req.sandbox.accounts.createLink(accountId(req), 'onboarding', 5 * MINUTE);
-    return created({ url: link.url, expires_at: link.expiresAt, created_at: link.createdAt });
+    const account = getAccount(req);
+    const body = new BodyReader(req.body);
+    const type = body.oneOf('type', ['onboarding', 'update', 'liveness'] as const, { required: true });
+    body.string('refresh_url', { required: true });
+    body.string('return_url', { required: true });
+    body.done();
+    if (type === 'update' && !account.requirementsDue.length) throw bachsError('CONNECTED_ACCOUNT_REQUIREMENTS_NOT_FOUND', 400, 'This account has no requirements to update.');
+    if (type === 'liveness') throw bachsError('CONNECTED_ACCOUNT_LIVENESS_NOT_NEEDED', 400, 'This account does not owe a liveness check.');
+    const link = req.sandbox.accounts.createLink(account.platformOwnerId, account.id, type!, 5 * MINUTE);
+    return ok(serializeAccountLink(link, account.id));
   }),
 
   route('POST', '/v1/accounts/:account_id/login_links', 'accounts.login_links.create', (req) => {
-    const link = req.sandbox.accounts.createLink(accountId(req), 'login', 5 * MINUTE);
-    return created({ url: link.url, created_at: link.createdAt });
+    const account = getAccount(req);
+    if ((account.attributes as Record<string, unknown>).dashboard !== 'light') throw bachsError('login_links_need_light', 400, 'Login links need the light dashboard.');
+    const link = req.sandbox.accounts.createLink(account.platformOwnerId, account.id, 'login', 5 * MINUTE);
+    return ok({ url: link.url, expires_at: link.expiresAt });
   }),
 
+  /** The invite email is not sent in the sandbox. */
   route('POST', '/v1/accounts/:account_id/dashboard_invite', 'accounts.dashboard_invite', (req) => {
-    const id = accountId(req);
-    const body = new BodyReader(req.body);
-    const email = body.string('email') ?? req.sandbox.accounts.get(id).email;
-    body.done();
-    if (!email) throw new SandboxError('validation_failed', 'An email is required.', { fieldErrors: [{ field: 'email', message: 'Required.' }] });
-    const link = req.sandbox.accounts.createLink(id, 'dashboard_invite', 7 * 24 * 60 * MINUTE);
-    return created({ account: id, email, url: link.url, expires_at: link.expiresAt, created_at: link.createdAt });
+    const account = getAccount(req);
+    const attrs = account.attributes as Record<string, unknown>;
+    if (attrs.dashboard !== 'full') throw bachsError('dashboard_invite_needs_full', 400, 'Dashboard invites need the full dashboard.');
+    if (!account.email) throw bachsError('dashboard_invite_needs_email', 400, 'The account has no contact email.');
+    if (attrs.dashboard_access === 'active') throw bachsError('dashboard_access_already_active', 400, 'Dashboard access is already active.');
+    const updated = req.sandbox.accounts.update(account.platformOwnerId, account.id, { attributes: { dashboard_access: 'invited' } });
+    return ok({ dashboard: 'full', dashboard_access: (updated.attributes as Record<string, unknown>).dashboard_access });
   }),
 
   route('POST', '/v1/accounts/:account_id/documents', 'accounts.documents.create', (req) => {
-    const id = accountId(req);
+    const account = getAccount(req);
     const body = new BodyReader(req.body);
-    const purpose = body.string('purpose', { required: true });
-    const fileName = body.string('file_name');
-    const personId = body.string('person_id');
+    const file = body.string('file', { required: true });
+    const document = body.string('document', { required: true });
     body.done();
-    return created(serializeDocument(req.sandbox.accounts.addDocument(id, { purpose, fileName: fileName ?? null, personId: personId ?? null })));
+    return created(serializeDocument(req.sandbox.accounts.addDocument(account.platformOwnerId, account.id, { slot: document, fileId: file, fileName: `${file}.pdf` })));
   }),
-
-  route('GET', '/v1/accounts/:account_id/documents', 'accounts.documents.list', (req) =>
-    list(req, req.sandbox.accounts.listDocuments(accountId(req)), serializeDocument),
-  ),
 
   route('GET', '/v1/accounts/:account_id/capabilities', 'accounts.capabilities.list', (req) => {
-    const account = req.sandbox.accounts.get(accountId(req));
-    return ok({ items: Object.entries(account.capabilities).map(([id, status]) => ({ id, account: account.id, status })) });
-  }),
-
-  route('GET', '/v1/accounts/:account_id/capabilities/:capability', 'accounts.capabilities.retrieve', (req) => {
-    const account = req.sandbox.accounts.get(accountId(req));
-    const name = req.params.capability ?? '';
-    const status = account.capabilities[name];
-    if (!status) throw new SandboxError('not_found', `Capability '${name}' has not been requested for ${account.id}.`);
-    return ok({ id: name, account: account.id, status });
-  }),
-
-  route('POST', '/v1/accounts/:account_id/capabilities/:capability', 'accounts.capabilities.update', (req) => {
-    const id = accountId(req);
-    const body = new BodyReader(req.body);
-    const requested = body.boolean('requested') ?? true;
-    body.done();
-    const name = req.params.capability ?? '';
-    const current = req.sandbox.accounts.get(id);
-    const status: CapabilityStatus = !requested ? 'inactive' : current.requirementsDue.length ? 'pending' : 'active';
-    const account = req.sandbox.accounts.setCapability(id, name, status);
-    return ok({ id: name, account: account.id, status: account.capabilities[name] });
+    const account = getAccount(req);
+    return ok({ items: Object.entries(account.capabilities).map(([name, c]) => serializeCapabilityItem(name, c)) });
   }),
 
   // Persons
 
-  route('GET', '/v1/accounts/:account_id/persons', 'persons.list', (req) => list(req, req.sandbox.accounts.listPersons(accountId(req)), serializePerson)),
+  route('GET', '/v1/accounts/:account_id/persons', 'persons.list', (req) => {
+    const account = getAccount(req);
+    return list(req, req.sandbox.accounts.listPersons(account.platformOwnerId, account.id), serializePerson, 50);
+  }),
 
   route('POST', '/v1/accounts/:account_id/persons', 'persons.create', (req) => {
-    const id = accountId(req);
+    const account = getAccount(req);
     const body = new BodyReader(req.body);
     const input = readPerson(body);
     body.done();
-    return created(serializePerson(req.sandbox.accounts.addPerson(id, input)));
+    return created(serializePerson(req.sandbox.accounts.addPerson(account.platformOwnerId, account.id, input)));
   }),
 
-  route('GET', '/v1/accounts/:account_id/persons/:person_id', 'persons.retrieve', (req) =>
-    ok(serializePerson(req.sandbox.accounts.getPerson(accountId(req), req.params.person_id ?? ''))),
-  ),
+  route('GET', '/v1/accounts/:account_id/persons/:person_id', 'persons.retrieve', (req) => {
+    const account = getAccount(req);
+    return ok(serializePerson(req.sandbox.accounts.getPerson(account.platformOwnerId, account.id, req.params.person_id ?? '')));
+  }),
 
   route('POST', '/v1/accounts/:account_id/persons/:person_id', 'persons.update', (req) => {
-    const id = accountId(req);
+    const account = getAccount(req);
     const body = new BodyReader(req.body);
     const input = readPerson(body);
     body.done();
-    return ok(serializePerson(req.sandbox.accounts.updatePerson(id, req.params.person_id ?? '', input)));
+    return ok(serializePerson(req.sandbox.accounts.updatePerson(account.platformOwnerId, account.id, req.params.person_id ?? '', input)));
   }),
 
-  route('DELETE', '/v1/accounts/:account_id/persons/:person_id', 'persons.remove', (req) =>
-    ok({ ...serializePerson(req.sandbox.accounts.removePerson(accountId(req), req.params.person_id ?? '')), deleted: true }),
-  ),
+  route('DELETE', '/v1/accounts/:account_id/persons/:person_id', 'persons.remove', (req) => {
+    const account = getAccount(req);
+    return ok({ ...serializePerson(req.sandbox.accounts.removePerson(account.platformOwnerId, account.id, req.params.person_id ?? '')), deleted: true });
+  }),
 
   route('POST', '/v1/accounts/:account_id/persons/:person_id/documents', 'persons.documents.create', (req) => {
-    const id = accountId(req);
+    const account = getAccount(req);
     const body = new BodyReader(req.body);
-    const purpose = body.string('purpose', { required: true });
-    const fileName = body.string('file_name');
+    const file = body.string('file', { required: true });
+    const document = body.string('document', { required: true });
     body.done();
-    return created(serializeDocument(req.sandbox.accounts.addDocument(id, { purpose, fileName: fileName ?? null, personId: req.params.person_id ?? null })));
+    return created(serializeDocument(req.sandbox.accounts.addDocument(account.platformOwnerId, account.id, { slot: document, fileId: file, fileName: `${file}.pdf`, personId: req.params.person_id ?? null })));
   }),
 
   // Transfers and platform fees
 
+  /**
+   * Draws on the available balance only. With X-Account-Id the account is debited; destination
+   * "self" then returns funds to the platform.
+   */
   route('POST', '/v1/transfers', 'transfers.create', (req) => {
-    platformOnly(req);
+    const sandbox = req.sandbox;
+    const platform = platformOwnerOf(req);
     const body = new BodyReader(req.body);
     const destination = body.string('destination', { required: true });
     const currency = body.currency('currency', { required: true });
     const amount = body.amount('amount', currency, { required: true });
-    const description = body.string('description');
+    const description = body.nullableString('description');
+    if (description && description.length > 500) body.fail('description', 'Must be at most 500 characters.');
+    const transferGroup = body.nullableString('transfer_group');
     const metadata = body.metadata();
     body.done();
-    const transfer = req.sandbox.transfers.create({ destination, amount: amount!, description: description ?? null, metadata: metadata ?? {} });
-    return created(serializeTransfer(transfer));
+
+    const acting = !isPlatformOwner(req.ownerId);
+    const sourceOwner = req.ownerId;
+    let destinationOwner: string;
+    if (destination === 'self') {
+      if (!acting) throw bachsError('VALIDATION_ERROR', 400, 'destination "self" needs X-Account-Id.', { field: 'destination' });
+      destinationOwner = platform;
+    } else {
+      const account = sandbox.accounts.find(destination);
+      if (!account || account.platformOwnerId !== platform) throw bachsError('NOT_FOUND', 404, `No account found with id '${destination}'.`);
+      destinationOwner = sandbox.accounts.ownerOf(account);
+    }
+    // The connected account needs an active transfers capability in either direction.
+    const accountSide = sandbox.accounts.find(localOf(acting ? sourceOwner : destinationOwner));
+    if (accountSide && accountSide.capabilities.transfers?.status !== 'active') {
+      throw bachsError('FORBIDDEN', 403, `The transfers capability is not active on ${accountSide.id}.`);
+    }
+    const transfer = sandbox.transfers.create({ sourceOwner, destinationOwner, amount: amount!, transferGroup: transferGroup ?? null, description: description ?? null, metadata: metadata ?? {} });
+    return created(serializeTransfer(viewOf(req, options), transfer));
   }),
 
   route('GET', '/v1/transfers', 'transfers.list', (req) => {
-    platformOnly(req);
-    return list(req, req.sandbox.transfers.list(req.query.destination ? { destination: req.query.destination } : {}), serializeTransfer);
+    const platform = platformOnly(req);
+    const view = viewOf(req, options);
+    const accountId = req.query.connected_account_id;
+    const account = accountId ? req.sandbox.accounts.find(accountId) : null;
+    const kind = req.query.kind === 'payout' || req.query.kind === 'manual' ? req.query.kind : undefined;
+    const items = req.sandbox.transfers.list(platform, { ...(account ? { owner: req.sandbox.accounts.ownerOf(account) } : {}), ...(kind ? { kind } : {}) });
+    return list(req, items, (t) => serializeTransfer(view, t), 50);
   }),
 
-  route('GET', '/v1/transfers/:transfer_id', 'transfers.retrieve', (req) => {
-    platformOnly(req);
-    return ok(serializeTransfer(req.sandbox.transfers.get(req.params.transfer_id ?? '')));
-  }),
+  route('GET', '/v1/transfers/:transfer_id', 'transfers.retrieve', (req) => ok(serializeTransfer(viewOf(req, options), req.sandbox.transfers.get(platformOwnerOf(req), req.params.transfer_id ?? '')))),
 
   route('GET', '/v1/platform_fees', 'platform_fees.list', (req) => {
-    platformOnly(req);
-    return list(req, req.sandbox.transfers.listPlatformFees(req.query.account ? { accountId: req.query.account } : {}), serializePlatformFee);
+    const view = viewOf(req, options);
+    return list(req, req.sandbox.transfers.listPlatformFees(platformOnly(req), req.query.charge ? { chargeId: req.query.charge } : {}), (f) => serializePlatformFee(view, f), 50);
   }),
 
-  route('GET', '/v1/platform_fees/:fee_id', 'platform_fees.retrieve', (req) => {
-    platformOnly(req);
-    return ok(serializePlatformFee(req.sandbox.transfers.getPlatformFee(req.params.fee_id ?? '')));
-  }),
+  route('GET', '/v1/platform_fees/:fee_id', 'platform_fees.retrieve', (req) => ok(serializePlatformFee(viewOf(req, options), req.sandbox.transfers.getPlatformFee(platformOnly(req), req.params.fee_id ?? '')))),
 ];

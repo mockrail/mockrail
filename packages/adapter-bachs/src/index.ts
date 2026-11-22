@@ -1,6 +1,6 @@
 import type { ProviderAdapter } from '@mockrail/core';
 import { bachsAuth } from './auth.js';
-import { BACHS, TEST_CARDS } from './constants.js';
+import { BACHS, BACHS_ID_FORMATS, TEST_CARDS, WEBHOOK_SECRET_FORMAT } from './constants.js';
 import { renderBachsError } from './errors.js';
 import { createEventMapper } from './events.js';
 import { resolveOptions, type BachsAdapterOptions } from './options.js';
@@ -36,6 +36,7 @@ export function createBachsAdapter(options: BachsAdapterOptions = {}): ProviderA
   return {
     providerId: BACHS.providerId,
     displayName: BACHS.displayName,
+    idPrefixes: BACHS_ID_FORMATS,
     routes: factories.flatMap((factory) => factory(resolved)),
     auth: bachsAuth,
     idempotency: { header: BACHS.idempotencyHeader, methods: ['POST', 'PATCH'], ttlMs: BACHS.idempotencyTtlMs },
@@ -47,7 +48,8 @@ export function createBachsAdapter(options: BachsAdapterOptions = {}): ProviderA
     requestIdHeader: 'x-request-id',
     webhookSigner: bachsWebhookSigner,
     deliveryPolicy: bachsDeliveryPolicy,
-    testCards: TEST_CARDS.map((c) => ({ number: c.number, description: c.description })),
+    webhookSecretFormat: WEBHOOK_SECRET_FORMAT,
+    testCards: [...TEST_CARDS.map((c) => ({ number: c.number, description: c.description })), { number: '4000000000000341', description: 'Saves, then later charges are declined' }],
     simulatePayment: simulateBachsPayment,
     mapDomainEvent: createEventMapper(resolved),
     renderError: renderBachsError,
@@ -58,11 +60,11 @@ export function createBachsAdapter(options: BachsAdapterOptions = {}): ProviderA
 export const adapter = createBachsAdapter();
 export default adapter;
 
-export { BACHS, PAYOUT_TRIGGERS, TEST_CARDS } from './constants.js';
-export { ERROR_CODES, renderBachsError } from './errors.js';
+export { BACHS, BACHS_ID_FORMATS, PAYOUT_TRIGGERS, SAVE_THEN_DECLINE_CARD, TEST_CARDS, WEBHOOK_EVENT_TYPES } from './constants.js';
+export { bachsError, ERROR_CODES, REASON_CODES, renderBachsError } from './errors.js';
 export { BACHS_EVENT_TYPES, type BachsEventType } from './events.js';
-export { formatAmount } from './money.js';
+export { formatAmount, parseAmount } from './money.js';
 export type { BachsAdapterOptions } from './options.js';
 export { paginate, type BachsList, type BachsPagination } from './pagination.js';
 export { BACHS_HEADERS, bachsDeliveryPolicy, bachsWebhookSigner, computeBachsSignature, verifyBachsSignature } from './signer.js';
-export { outcomeForCard, outcomeForDestination } from './test-triggers.js';
+export { futureOutcomeForCard, outcomeForCard, outcomeForDestination } from './test-triggers.js';
