@@ -1,0 +1,110 @@
+{
+  "_comment": "Values documented by Bachs, as recorded in the architecture review of 21 Nov 2026. Replace or extend with verbatim payload examples as each page is opened (see UNVERIFIED.md).",
+  "endpoints": {
+    "source": "https://docs.bachs.io/llms.txt",
+    "routes": [
+      "POST /v1/checkout-sessions",
+      "GET /v1/checkout-sessions/:checkout_id",
+      "GET /v1/payments",
+      "GET /v1/payments/:payment_id",
+      "POST /v1/charges",
+      "POST /v1/customers",
+      "GET /v1/customers",
+      "GET /v1/customers/:customer_id",
+      "PATCH /v1/customers/:customer_id",
+      "POST /v1/products",
+      "GET /v1/products",
+      "GET /v1/products/:product_id",
+      "PATCH /v1/products/:product_id",
+      "POST /v1/products/:product_id/archive",
+      "POST /v1/products/:product_id/unarchive",
+      "GET /v1/subscriptions",
+      "GET /v1/subscriptions/:subscription_id",
+      "PATCH /v1/subscriptions/:subscription_id",
+      "DELETE /v1/subscriptions/:subscription_id",
+      "POST /v1/virtual-accounts",
+      "GET /v1/virtual-accounts",
+      "POST /v1/refunds",
+      "GET /v1/refunds",
+      "GET /v1/refunds/:refund_id",
+      "GET /v1/refunds/by-charge/:payment_id",
+      "POST /v1/payouts/quotes",
+      "POST /v1/payouts",
+      "GET /v1/payouts",
+      "GET /v1/payouts/:withdrawal_id",
+      "GET /v1/balances",
+      "POST /v1/webhooks/replay",
+      "POST /v1/accounts",
+      "GET /v1/accounts",
+      "GET /v1/accounts/:account_id",
+      "POST /v1/accounts/:account_id",
+      "POST /v1/transfers",
+      "GET /v1/transfers",
+      "GET /v1/transfers/:transfer_id",
+      "GET /v1/platform_fees",
+      "GET /v1/platform_fees/:fee_id"
+    ]
+  },
+  "errors": {
+    "source": "https://docs.bachs.io/errors",
+    "fields": ["error_code", "detail", "doc_url", "errors", "details"],
+    "fieldErrorFields": ["field", "message"],
+    "codes": {
+      "idempotency_conflict": { "status": 409, "error_code": "IDEMPOTENCY_CONFLICT" },
+      "idempotency_in_progress": { "status": 409, "error_code": "IDEMPOTENCY_IN_PROGRESS" },
+      "bad_request": { "status": 400, "error_code": "BAD_REQUEST" },
+      "unauthorized": { "status": 401 },
+      "forbidden": { "status": 403 },
+      "recipient_incomplete": { "error_code": "PAYOUT_RECIPIENT_INCOMPLETE" }
+    }
+  },
+  "pagination": {
+    "source": "https://docs.bachs.io/guides/pagination",
+    "listFields": ["items", "pagination"],
+    "paginationFields": ["next_cursor", "prev_cursor", "has_more", "limit", "offset", "returned", "total"],
+    "defaultLimit": 20,
+    "maxLimit": 100
+  },
+  "money": {
+    "source": "https://docs.bachs.io/api-reference/api-standards",
+    "examples": [{ "minor": 2900, "currency": "USD", "wire": "29.00" }]
+  },
+  "webhooks": {
+    "source": "https://docs.bachs.io/guides/webhooks/overview",
+    "envelopeFields": ["id", "type", "created_at", "organization_id", "data"],
+    "eventIdPrefix": "evt_",
+    "signedPayload": "{timestamp}.{raw_body}",
+    "headers": ["X-Bachs-Timestamp", "X-Bachs-Signature", "X-Bachs-Signature-V2"],
+    "retryableStatuses": [408, 429, 500, 502, 503],
+    "nonRetryableStatuses": [400, 401, 404, 410],
+    "maxAttempts": 5,
+    "retryDelaysMinutes": [1, 5, 15, 60],
+    "timeoutSeconds": 10
+  },
+  "testCards": {
+    "source": "https://docs.bachs.io/integrate/sandbox",
+    "cards": {
+      "4000000000000002": "declined",
+      "4000000000009995": "insufficient_funds",
+      "4000000000000069": "expired_card",
+      "4000000000000119": "processing_error"
+    },
+    "succeeds": "4242424242424242"
+  },
+  "payoutTriggers": {
+    "source": "https://docs.bachs.io/connect/testing",
+    "bankComplete": { "bank_code": "999", "account_number": "0001112223" },
+    "bankFail": { "bank_code": "998", "account_number": "0001112224" },
+    "cryptoComplete": "0x1111111111111111111111111111111111111111",
+    "cryptoFail": "0x2222222222222222222222222222222222222222"
+  },
+  "statuses": {
+    "charge": {
+      "source": "https://docs.bachs.io/guides/payments/statuses",
+      "api": ["open", "incomplete", "succeeded", "accepted", "underpaid", "overpaid", "failed", "refunded", "partially_refunded", "auto_refunded"],
+      "webhook": ["SUCCEEDED", "ACCEPTED", "OVERPAID", "UNDERPAID"]
+    },
+    "refund": { "source": "https://docs.bachs.io/guides/refunds", "values": ["processing", "success", "failed"] },
+    "payout": { "source": "https://docs.bachs.io/guides/payouts/how-payouts-work", "values": ["pending", "processing", "completed", "failed"] }
+  }
+}
